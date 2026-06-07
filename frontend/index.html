@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>一拍迹合 - 把抖音精选里的旅行视频，变成更契合你旅行人格的线路图</title>
+  <link rel="stylesheet" href="css/style.css">
+  <!-- 高德地图 JS API -->
+  <script>
+    window._AMapSecurityConfig = {
+      securityJsCode: 'b01d7d9e9a0316af03bd430f49d8def7',
+    };
+  </script>
+  <script src="https://webapi.amap.com/maps?v=2.0&key=f82fd3115909f6cda7b1378ff7b2e3cb"></script>
+  <!-- html2canvas: 图文海报截图 -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+</head>
+<body>
+  <!-- 全局加载动画 -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loader">
+      <div class="loader-dot"></div>
+      <div class="loader-dot"></div>
+      <div class="loader-dot"></div>
+    </div>
+  </div>
+
+  <!-- 应用容器 -->
+  <div id="app">
+    <!-- 顶部导航 -->
+    <header class="app-header">
+      <div class="header-content">
+        <div class="logo">
+          <span class="logo-icon">🗺️</span>
+          <span class="logo-text">一拍迹合</span>
+        </div>
+        <!-- 简化步骤导航：只显示当前步骤 + 进度条 -->
+        <nav class="step-nav" id="step-nav">
+          <div class="step-progress">
+            <div class="step-progress-bar" id="step-progress-bar" style="width: 0%"></div>
+          </div>
+          <div class="step-current" id="step-current">
+            <span class="step-current-number" id="step-current-number">1</span>
+            <span class="step-current-label" id="step-current-label">旅行人格</span>
+            <span class="step-current-total">/ 7</span>
+          </div>
+        </nav>
+        <div class="header-right" id="header-right">
+          <button class="btn-login" id="btn-show-login" onclick="showPage('login')">登录 / 注册</button>
+          <div class="user-menu" id="user-menu" style="display:none;">
+            <button class="user-avatar-btn" onclick="toggleUserDropdown()">
+              <span class="user-avatar-icon" id="user-avatar-letter"></span>
+              <span class="user-avatar-name" id="user-display-name"></span>
+            </button>
+            <div class="user-dropdown" id="user-dropdown">
+              <div class="dropdown-header">
+                <div class="dropdown-mbti" id="dropdown-mbti-type">未测试</div>
+                <div class="dropdown-mbti-name" id="dropdown-mbti-name">完成旅行人格测试后显示</div>
+              </div>
+              <button class="dropdown-item" onclick="showPersonaModal()">🧬 查看旅行人格</button>
+              <button class="dropdown-item" onclick="retakeMBTI()">🔄 重新测试</button>
+              <button class="dropdown-item" onclick="showTravelHistory()">📋 旅行历史</button>
+              <div class="dropdown-divider"></div>
+              <button class="dropdown-item logout" onclick="logoutUser()">🚪 退出登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 页面容器 -->
+    <main class="page-container">
+
+      <!-- Page: 登录 -->
+      <section id="page-login" class="page auth-page">
+        <div class="auth-card">
+          <div class="auth-logo">
+            <span class="auth-logo-icon">🗺️</span>
+            <h1 class="auth-logo-text">一拍迹合</h1>
+            <p class="auth-logo-sub">把抖音精选里的旅行视频，<br>变成更契合你旅行人格的线路图</p>
+          </div>
+          <form class="auth-form" id="login-form" onsubmit="handleLogin(event)">
+            <div class="form-error" id="login-error"></div>
+            <div class="form-field">
+              <label>用户名</label>
+              <input type="text" id="login-username" placeholder="输入用户名" autocomplete="username" required>
+            </div>
+            <div class="form-field">
+              <label>密码</label>
+              <input type="password" id="login-password" placeholder="输入密码" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn-auth" id="btn-login">登录</button>
+          </form>
+          <div class="auth-switch">
+            还没有账号？<a href="javascript:void(0)" onclick="showPage('register')">立即注册</a>
+          </div>
+        </div>
+      </section>
+
+      <!-- Page: 注册 -->
+      <section id="page-register" class="page auth-page">
+        <div class="auth-card">
+          <div class="auth-logo">
+            <span class="auth-logo-icon">🗺️</span>
+            <h1 class="auth-logo-text">创建账号</h1>
+            <p class="auth-logo-sub">开始你的个性化旅行体验</p>
+          </div>
+          <form class="auth-form" id="register-form" onsubmit="handleRegister(event)">
+            <div class="form-error" id="register-error"></div>
+            <div class="form-field">
+              <label>用户名</label>
+              <input type="text" id="reg-username" placeholder="3-20个字符" autocomplete="username" required>
+              <span class="field-hint">字母、数字、下划线或中文</span>
+            </div>
+            <div class="form-field">
+              <label>密码</label>
+              <input type="password" id="reg-password" placeholder="6-20个字符" autocomplete="new-password" required>
+            </div>
+            <div class="form-field">
+              <label>确认密码</label>
+              <input type="password" id="reg-password2" placeholder="再次输入密码" autocomplete="new-password" required>
+            </div>
+            <button type="submit" class="btn-auth" id="btn-register">注册</button>
+          </form>
+          <div class="auth-switch">
+            已有账号？<a href="javascript:void(0)" onclick="showPage('login')">去登录</a>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 1: 旅行人格测试 -->
+      <section id="page-mbti" class="page">
+        <div class="page-inner">
+          <div class="mbti-hero">
+            <h1 class="hero-title">先聊聊你的旅行风格</h1>
+            <p class="hero-subtitle">旅行观，或者说是你的旅行人格是相对稳定的。<br>了解你的旅行人格，能够帮助我们更好地找到契合你的旅行方案</p>
+          </div>
+          <div id="mbti-questions" class="mbti-questions"></div>
+          <div id="mbti-result" class="mbti-result hidden"></div>
+        </div>
+      </section>
+
+      <!-- Step 2: 行程规划 -->
+      <section id="page-plan" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div id="plan-check-section" class="plan-check-section" style="display:none;">
+            <div class="plan-check-hero">
+              <h1>你有未完成的旅行计划</h1>
+              <p>是否继续之前的计划？</p>
+            </div>
+            <div id="existing-plans-list" class="existing-plans-list"></div>
+            <div class="plan-check-actions">
+              <button class="btn-secondary" onclick="handlePlanChoice('new')">
+                <span>✨</span> 开始新计划
+              </button>
+            </div>
+          </div>
+          <div id="new-plan-section" class="new-plan-section">
+            <div id="plan-persona" class="plan-persona" style="display:none;"></div>
+            <div class="dest-hero">
+              <h1>想去哪儿？</h1>
+              <p>告诉我们你的旅行计划</p>
+            </div>
+            <div class="dest-form">
+              <div class="form-group">
+                <label>目的地</label>
+                <div class="city-select">
+                  <button class="city-btn active" data-city="上海">上海</button>
+                  <span class="city-more">更多城市即将开放</span>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>旅行天数</label>
+                <div class="days-input-wrap">
+                  <input type="number" id="plan-days-input" class="days-input"
+                    min="1" max="30" step="1" value="2" inputmode="numeric"
+                    placeholder="请输入天数">
+                  <span class="days-input-unit">天</span>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>人均预算（元）</label>
+                <div class="budget-input-wrap">
+                  <span class="budget-input-prefix">¥</span>
+                  <input type="number" id="plan-budget-input" class="budget-input"
+                    min="0" max="100000" step="50" value="500" inputmode="numeric"
+                    placeholder="如 500">
+                  <span class="budget-input-unit">/ 人（整趟）</span>
+                </div>
+                <p class="budget-input-tip">我们会结合各地点的人均消费，估算整趟人均花费并尽量贴合你的预算。</p>
+              </div>
+              <button class="btn-primary btn-next" id="btn-to-buddy">
+                <span>下一步：旅行搭子</span>
+                <span class="btn-arrow">→</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 3: 旅行搭子 -->
+      <section id="page-buddy" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div class="buddy-hero">
+            <h1>这次旅行有搭子吗？</h1>
+            <p>如果有搭子，可以同步旅行计划一起规划</p>
+          </div>
+          <div class="buddy-options">
+            <button class="buddy-option-btn" onclick="handleBuddyChoice(true)">
+              <span class="buddy-option-icon">👥</span>
+              <span class="buddy-option-label">有搭子</span>
+              <span class="buddy-option-desc">一起规划，同步行程</span>
+            </button>
+            <button class="buddy-option-btn" onclick="handleBuddyChoice(false)">
+              <span class="buddy-option-icon">🧑‍🎒</span>
+              <span class="buddy-option-label">独自出发</span>
+              <span class="buddy-option-desc">一个人的旅行也很精彩</span>
+            </button>
+          </div>
+          <div id="buddy-input-section" class="buddy-input-section" style="display:none;">
+            <div class="buddy-input-card">
+              <h3>输入搭子信息</h3>
+              <div class="form-field">
+                <label>搭子的用户名或 UID</label>
+                <input type="text" id="buddy-identifier" placeholder="输入用户名或UID">
+              </div>
+              <div class="buddy-input-actions">
+                <button class="btn-primary" onclick="submitBuddySync()">同步计划</button>
+                <button class="btn-text" onclick="handleBuddyChoice(false)">跳过</button>
+              </div>
+              <div id="buddy-sync-status" class="buddy-sync-status"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 4: 精选视频 -->
+      <section id="page-videos" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div class="video-header">
+            <h1>收藏了哪些旅行视频？</h1>
+            <p>粘贴你收藏的抖音视频链接，AI 帮你提取旅行灵感</p>
+          </div>
+          <div class="video-input-area">
+            <div class="video-link-input-group">
+              <textarea id="video-links-input" class="video-links-textarea"
+                placeholder="粘贴视频分享链接，每行一个&#10;例如：&#10;https://v.douyin.com/xxxxx&#10;https://v.douyin.com/yyyyy"></textarea>
+              <button class="btn-primary" id="btn-analyze-videos" onclick="analyzeVideoLinks()">
+                <span>🔍 AI 分析</span>
+              </button>
+            </div>
+            <button class="btn-text" onclick="skipVideoStep()">跳过，直接规划路线</button>
+          </div>
+          <div id="analysis-progress" class="analysis-progress" style="display:none;">
+            <div class="progress-bar-container">
+              <div class="progress-bar" id="analysis-progress-bar"></div>
+            </div>
+            <p class="progress-text" id="analysis-progress-text">正在分析视频内容...</p>
+          </div>
+          <div id="analysis-results" class="analysis-results" style="display:none;"></div>
+        </div>
+      </section>
+
+      <!-- Step 5: 地图预览 -->
+      <section id="page-map" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div class="map-preview-header">
+            <h1>景点地图预览</h1>
+            <p>AI 从视频中提取的景点已标记在地图上</p>
+            <div class="map-preview-style-echo hidden" id="map-preview-style-echo"></div>
+          </div>
+          <div class="map-preview-layout">
+            <div class="map-preview-left">
+              <div id="map-location-list" class="map-location-list"></div>
+            </div>
+            <div class="map-preview-right">
+              <div id="map-preview-container" class="map-container">
+                <div class="map-placeholder">
+                  <span>🗺️</span>
+                  <p>地图加载中...</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="map-preview-footer">
+            <button class="btn-primary btn-next" id="btn-generate-plan">
+              <span>AI 生成旅行计划</span>
+              <span class="btn-arrow">→</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 6: 路线生成 -->
+      <section id="page-itinerary" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div class="itin-header">
+            <h1>你的专属路线</h1>
+            <p id="itin-summary"></p>
+            <div id="itin-cost" class="itin-cost" style="display:none;"></div>
+          </div>
+          <div class="itin-layout">
+            <div class="itin-left">
+              <div id="itinerary-timeline" class="itinerary-timeline"></div>
+              <!-- 推荐景点磁贴池 -->
+              <div id="rec-pool" class="rec-pool" style="display:none;">
+                <div class="rec-pool-header">
+                  <span class="rec-pool-icon">✨</span>
+                  <span class="rec-pool-title">更多推荐景点</span>
+                  <span class="rec-pool-hint">拖拽到上方某一天中</span>
+                </div>
+                <div id="rec-pool-tiles" class="rec-pool-tiles"></div>
+              </div>
+            </div>
+            <div class="itin-right">
+              <div id="map-container" class="map-container">
+                <div class="map-placeholder">
+                  <span>🗺️</span>
+                  <p>地图加载中...</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="itin-footer">
+            <button class="btn-primary btn-next" id="btn-to-export">
+              <span>导出旅行计划</span>
+              <span class="btn-arrow">→</span>
+            </button>
+            <button class="btn-save-history" id="btn-save-history" style="display:none;" onclick="saveTravelHistory()">
+              💾 保存到旅行历史
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 7: 导出分享 -->
+      <section id="page-export" class="page">
+        <div class="page-inner">
+          <button class="btn-back" onclick="goToPreviousStep()">← 返回上一步</button>
+          <div class="export-hero">
+            <h1>导出你的旅行计划</h1>
+            <p>选择一种方式保存或分享给朋友</p>
+          </div>
+          <div class="export-options">
+            <div class="export-card" onclick="exportPlan('pdf')">
+              <div class="export-card-icon">📄</div>
+              <div class="export-card-title">PDF 文档</div>
+              <div class="export-card-desc">精美排版，离线查看</div>
+            </div>
+            <div class="export-card" onclick="exportPlan('image')">
+              <div class="export-card-icon">🖼️</div>
+              <div class="export-card-title">图文海报</div>
+              <div class="export-card-desc">一键生成分享图片</div>
+            </div>
+            <div class="export-card" onclick="exportPlan('document')">
+              <div class="export-card-icon">📝</div>
+              <div class="export-card-title">详细文档</div>
+              <div class="export-card-desc">完整攻略，包含所有细节</div>
+            </div>
+          </div>
+          <div class="export-footer">
+            <button class="btn-secondary" onclick="goToPage(6)">
+              ← 返回路线
+            </button>
+            <button class="btn-primary" onclick="startNewTrip()">
+              ✨ 开始新的旅行
+            </button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- ========== AI搭子：浮动按钮 + 侧边聊天面板 ========== -->
+    <div id="chat-fab" class="chat-fab" onclick="toggleChatPanel()" style="display:none;">
+      <span class="chat-fab-icon">🧳</span>
+      <span class="chat-fab-badge" id="chat-fab-badge" style="display:none;">1</span>
+    </div>
+
+    <div id="chat-panel" class="chat-panel">
+      <div class="chat-panel-header">
+        <div class="chat-panel-title">
+          <span>🧳</span>
+          <span>一拍迹合 AI</span>
+        </div>
+        <button class="chat-panel-close" onclick="toggleChatPanel()">✕</button>
+      </div>
+      <div class="chat-panel-messages" id="chat-messages">
+        <div class="chat-welcome">
+          <div class="welcome-avatar">🧳</div>
+          <h2>一拍迹合已就位</h2>
+          <p>旅行中遇到任何问题，随时问我！</p>
+          <div class="quick-questions">
+            <button class="quick-btn" data-q="我走累了，附近有咖啡店吗？">☕ 找咖啡店</button>
+            <button class="quick-btn" data-q="下雨了，帮我调整路线">🌧️ 下雨调整</button>
+            <button class="quick-btn" data-q="这里有什么好吃的？">🍜 找美食</button>
+            <button class="quick-btn" data-q="帮我找个拍照点">📸 找拍照点</button>
+          </div>
+        </div>
+      </div>
+      <div class="chat-panel-input">
+        <textarea id="chat-input" class="chat-textarea" placeholder="问我任何旅行中的问题..." rows="1"></textarea>
+        <button id="chat-send" class="btn-send">
+          <span>发送</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 旅行历史弹窗 -->
+    <div class="modal-overlay hidden" id="history-modal" onclick="if(event.target===this)this.classList.add('hidden')">
+      <div class="modal" style="width: 560px;">
+        <div class="modal-header">
+          <span class="modal-title">旅行历史</span>
+          <button class="modal-close" onclick="document.getElementById('history-modal').classList.add('hidden')">✕</button>
+        </div>
+        <div class="modal-body" id="history-content">
+          <p style="color: var(--text-muted); text-align: center;">暂无旅行记录</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 景点反馈浮层 -->
+    <div id="stop-feedback-popup" class="stop-feedback-popup hidden" onclick="if(event.target===this)closeStopFeedback()">
+      <div class="stop-feedback-card">
+        <button class="stop-feedback-close" onclick="closeStopFeedback()">✕</button>
+        <div class="stop-feedback-header">
+          <span class="stop-feedback-emoji">📍</span>
+          <div class="stop-feedback-info">
+            <div class="stop-feedback-name" id="feedback-stop-name">景点名称</div>
+            <div class="stop-feedback-desc" id="feedback-stop-desc">景点描述</div>
+          </div>
+        </div>
+        <div class="stop-feedback-actions">
+          <button class="feedback-btn feedback-like" onclick="submitStopFeedback('like')">
+            <span class="feedback-btn-icon">👍</span>
+            <span class="feedback-btn-label">感兴趣</span>
+          </button>
+          <button class="feedback-btn feedback-must" onclick="submitStopFeedback('must')">
+            <span class="feedback-btn-icon">⭐</span>
+            <span class="feedback-btn-label">必去</span>
+          </button>
+          <button class="feedback-btn feedback-dislike" onclick="submitStopFeedback('dislike')">
+            <span class="feedback-btn-icon">👎</span>
+            <span class="feedback-btn-label">换一个</span>
+          </button>
+        </div>
+        <div class="stop-feedback-status" id="feedback-status"></div>
+      </div>
+    </div>
+
+    <!-- Toast 通知容器 -->
+    <div id="toast-container"></div>
+
+    <!-- 旅行人格弹窗 -->
+    <div class="modal-overlay hidden" id="persona-modal" onclick="if(event.target===this)this.classList.add('hidden')">
+      <div class="modal" style="width: 560px; max-height: 90vh; overflow-y: auto;">
+        <div class="modal-header">
+          <span class="modal-title">我的旅行人格</span>
+          <button class="modal-close" onclick="document.getElementById('persona-modal').classList.add('hidden')">✕</button>
+        </div>
+        <div class="modal-body" id="persona-modal-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

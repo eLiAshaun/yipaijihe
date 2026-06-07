@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "exa": {
+      "baseUrl": "https://mcp.exa.ai/mcp"
+    },
+    "douyin": {
+      "command": "/bin/zsh",
+      "args": [
+        "-lc",
+        "cd agent-reach/tools/douyin-mcp-server && exec '.venv/bin/python' -m douyin_mcp_server.server"
+      ],
+      "env": {
+        "MIMO_API_KEY": "your-mimo-api-key-here",
+        "MIMO_API_BASE": "https://token-plan-cn.xiaomimimo.com/v1",
+        "MIMO_MODEL": "mimo-v2.5-asr"
+      }
+    }
+  }
+}
