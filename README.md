@@ -97,6 +97,19 @@ tests/
 尊重 `prefers-reduced-motion`；全部交互可键盘操作。
 人格插画 / 贴纸已转 WebP（46 MB → 1.3 MB）。
 
+## 部署
+
+仓库自带 `Dockerfile`（gunicorn）和 `render.yaml`。以 Render 为例：**New → Blueprint → 选择本仓库**，
+在控制台按需填写 `LLM_API_KEY` / `AMAP_JS_KEY` 等（全部留空则为 Demo 模式）。
+任何支持 Docker 的平台（Fly.io / Railway / 自有服务器）同理：
+
+```bash
+docker build -t yipaijihe .
+docker run -p 8080:8080 -v yipaijihe-data:/data -e AMAP_JS_KEY=... yipaijihe
+```
+
+SQLite 位于 `/data`，请挂载持久卷；视频分析是 1–2 分钟的长请求，网关超时需 ≥ 300 s。
+
 ## 测试
 
 ```bash

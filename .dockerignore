@@ -1,0 +1,10 @@
+.git
+.venv
+instance
+figure
+agent-reach
+tests
+**/__pycache__
+.env
+*.md
+frontend/assets/**/*.png
