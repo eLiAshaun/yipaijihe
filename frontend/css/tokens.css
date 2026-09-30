@@ -1,0 +1,131 @@
+/* ==========================================================================
+   一拍迹合 · Design Tokens
+   视觉概念：「旅行手账」—— 暖纸、墨色、朱红印章、贴纸与登机牌
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* --- Paper & ink --- */
+  --paper: #f4eee1;
+  --paper-2: #ece3d0;
+  --paper-3: #e2d6bd;
+  --card: #fbf7ee;
+  --card-2: #fffdf8;
+  --ink: #1e1915;
+  --ink-2: #5a5046;
+  --ink-3: #8a7f71;
+  --line: #d9cdb7;
+  --line-2: #e7decc;
+
+  /* --- Accents --- */
+  --seal: #d6402a;          /* 朱红印章：主强调色 */
+  --seal-strong: #b93220;
+  --seal-soft: #f6d9d1;
+  --on-seal: #fffaf5;
+  --sea: #1f6b73;           /* 海青：路线 / 信息 */
+  --sea-soft: #d3e5e3;
+  --sun: #e2a63b;           /* 日光黄：高亮 / 必去 */
+  --sun-soft: #f5e3bb;
+  --moss: #5d7b4c;          /* 苔绿：成功 */
+  --moss-soft: #dde8d3;
+
+  /* 路线 · 按天着色 */
+  --day-1: #d6402a;
+  --day-2: #1f6b73;
+  --day-3: #e2a63b;
+  --day-4: #6a4c93;
+  --day-5: #5d7b4c;
+  --day-6: #c2557f;
+  --day-7: #3a6ea5;
+  --day-8: #8a5a2b;
+
+  /* 地点类型 */
+  --t-food: #d9782d;
+  --t-nature: #5d7b4c;
+  --t-culture: #6a4c93;
+  --t-landmark: #d6402a;
+  --t-street: #1f6b73;
+  --t-other: #8a7f71;
+
+  /* --- Shadows --- */
+  --shadow-1: 0 1px 0 rgb(255 255 255 / 0.7) inset, 0 1px 2px rgb(60 40 20 / 0.08);
+  --shadow-2: 0 1px 0 rgb(255 255 255 / 0.7) inset, 0 14px 30px -18px rgb(60 40 20 / 0.4);
+  --shadow-3: 0 30px 60px -28px rgb(60 40 20 / 0.5), 0 2px 6px rgb(60 40 20 / 0.08);
+  --hard: 0 3px 0 var(--ink);
+
+  /* --- Shape --- */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 16px;
+  --r-lg: 24px;
+  --r-xl: 32px;
+  --r-pill: 999px;
+
+  /* --- Type --- */
+  --font-display: "Noto Serif SC", "Songti SC", "STSong", "Source Han Serif SC", "SimSun", serif;
+  --font-body: "Noto Sans SC", "PingFang SC", "HarmonyOS Sans SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "DM Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.875rem;
+  --fs-md: 1rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem);
+  --fs-2xl: clamp(1.6rem, 1.2rem + 1.6vw, 2.25rem);
+  --fs-3xl: clamp(2rem, 1.3rem + 3vw, 3.5rem);
+  --fs-hero: clamp(2.5rem, 1.2rem + 5.6vw, 5.25rem);
+
+  /* --- Space --- */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 72px;
+
+  --gutter: clamp(16px, 4vw, 40px);
+  --maxw: 1240px;
+  --topbar-h: 64px;
+
+  /* --- Motion --- */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-1: 140ms;
+  --dur-2: 260ms;
+  --dur-3: 520ms;
+
+  --grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .35  0 0 0 0 .27  0 0 0 0 .18  0 0 0 .55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #16120e;
+  --paper-2: #1d1813;
+  --paper-3: #2a231b;
+  --card: #201a14;
+  --card-2: #271f18;
+  --ink: #f2eadb;
+  --ink-2: #c1b5a2;
+  --ink-3: #8d8272;
+  --line: #3a3128;
+  --line-2: #2d261f;
+
+  --seal: #ee5a42;
+  --seal-strong: #ff7a63;
+  --seal-soft: #47231c;
+  --on-seal: #1b0f0b;
+  --sea: #55b3bd;
+  --sea-soft: #16363a;
+  --sun: #f0bd5a;
+  --sun-soft: #3d2f12;
+  --moss: #93b77f;
+  --moss-soft: #223019;
+
+  --shadow-1: 0 1px 0 rgb(255 255 255 / 0.04) inset;
+  --shadow-2: 0 1px 0 rgb(255 255 255 / 0.05) inset, 0 14px 30px -18px rgb(0 0 0 / 0.8);
+  --shadow-3: 0 30px 60px -28px rgb(0 0 0 / 0.9);
+  --hard: 0 3px 0 rgb(0 0 0 / 0.65);
+}

@@ -176,53 +176,21 @@ def generate():
 
 @itinerary_bp.route("/save", methods=["POST"])
 def save_itinerary():
-    """
-    保存路线到用户旅行历史（需登录）
-
-    请求体：{ "token": "xxx", "city": "上海", "days": 2, "itinerary": {...}, ... }
-    """
+    """兼容旧接口：保存行程到当前用户（新代码请用 POST /api/trips）"""
     from backend.routes.auth import _get_current_user
+    from backend.services import trips as repo
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "请提供旅行数据"}), 400
-
     user = _get_current_user()
     if not user:
         return jsonify({"error": "请先登录"}), 401
-
-    from datetime import datetime
-
-    trip = {
-        "city": data.get("city", "上海"),
-        "days": data.get("days", 2),
-        "companions": data.get("companions", ""),
-        "budget": data.get("budget", ""),
-        "mbti_type": user.get("mbti_type"),
-        "itinerary": data.get("itinerary"),
-        "date": datetime.now().strftime("%Y-%m-%d"),
-    }
-
-    db = get_db()
     try:
-        row = db.execute(
-            "SELECT travel_history FROM users WHERE id = ?", (user["id"],)
-        ).fetchone()
-
-        history = json.loads(row["travel_history"]) if row["travel_history"] else []
-        history.append(trip)
-
-        db.execute(
-            "UPDATE users SET travel_history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (json.dumps(history, ensure_ascii=False), user["id"])
-        )
-        db.commit()
-        return jsonify({"message": "旅行已保存", "trip": trip}), 201
-    except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        db.close()
+        trip = repo.create_trip(user, data)
+    except repo.TripError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"message": "旅行已保存", "trip": trip}), 201
 
 
 def _normalize_name(name: str) -> str:

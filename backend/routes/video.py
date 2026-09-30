@@ -10,8 +10,10 @@ import logging
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request
 from backend.config import Config
+from backend.routes.auth import login_required
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,19 @@ video_bp = Blueprint("video", __name__)
 
 # 并行处理线程池（最多同时处理 3 个视频，避免资源争抢）
 _executor = ThreadPoolExecutor(max_workers=3)
+
+# 服务端会主动请求用户提交的链接 —— 只允许抖音系域名，防止被当作 SSRF 跳板
+_ALLOWED_VIDEO_HOSTS = ("douyin.com", "iesdouyin.com", "amemv.com")
+MAX_VIDEO_URLS = 10
+
+
+def is_allowed_video_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in ("http", "https") and any(host == d or host.endswith("." + d) for d in _ALLOWED_VIDEO_HOSTS)
 
 # 视频地点提取后置过滤：排除城市/行政区/交通住宿/泛称等非游玩点
 _GENERIC_LOCATION_NAMES = {
@@ -92,6 +107,7 @@ def _process_single_video(url: str, index: int, total: int, mbti: str) -> dict:
 
 
 @video_bp.route("/analyze", methods=["POST"])
+@login_required
 def analyze_video():
     """
     分析用户提供的视频链接（并行处理）
@@ -106,7 +122,14 @@ def analyze_video():
     if not data or not data.get("urls"):
         return jsonify({"error": "请提供视频链接"}), 400
 
-    urls = [u.strip() for u in data["urls"] if u.strip()]
+    if not isinstance(data["urls"], list):
+        return jsonify({"error": "urls 需要是链接数组"}), 400
+    urls = [u.strip() for u in data["urls"] if isinstance(u, str) and u.strip()]
+    if len(urls) > MAX_VIDEO_URLS:
+        return jsonify({"error": f"一次最多分析 {MAX_VIDEO_URLS} 个视频"}), 400
+    bad = [u for u in urls if not is_allowed_video_url(u)]
+    if bad:
+        return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）", "invalid": bad[:3]}), 400
     personality = data.get("personality", {})
     mbti = personality.get("mbti", "")
 
@@ -187,6 +210,7 @@ def analyze_video():
 
 
 @video_bp.route("/transcribe", methods=["POST"])
+@login_required
 def transcribe_single():
     """
     单个视频转写（用于实时进度展示）
@@ -198,6 +222,8 @@ def transcribe_single():
         return jsonify({"error": "请提供视频链接"}), 400
 
     url = data["url"].strip()
+    if not is_allowed_video_url(url):
+        return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）"}), 400
     transcript, video_title, err_msg = _transcribe_video(url)
 
     if not transcript:

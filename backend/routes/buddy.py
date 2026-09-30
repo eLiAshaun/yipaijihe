@@ -6,6 +6,8 @@ import json
 import logging
 from flask import Blueprint, jsonify, request
 from backend.database import get_db
+from backend.routes.auth import login_required
+from backend.services import trips as trips_repo
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,7 @@ buddy_bp = Blueprint("buddy", __name__)
 
 
 @buddy_bp.route("/sync", methods=["POST"])
+@login_required
 def sync_buddy():
     """
     旅行搭子同步
@@ -42,7 +45,7 @@ def sync_buddy():
     try:
         # 尝试按用户名查找
         buddy = db.execute(
-            "SELECT id, username, mbti_type, travel_history FROM users WHERE username = ?",
+            "SELECT id, username, mbti_type FROM users WHERE username = ?",
             (identifier,),
         ).fetchone()
 
@@ -51,7 +54,7 @@ def sync_buddy():
             try:
                 uid = int(identifier)
                 buddy = db.execute(
-                    "SELECT id, username, mbti_type, travel_history FROM users WHERE id = ?",
+                    "SELECT id, username, mbti_type FROM users WHERE id = ?",
                     (uid,),
                 ).fetchone()
             except ValueError:
@@ -60,13 +63,12 @@ def sync_buddy():
         if not buddy:
             return jsonify({"error": "未找到该用户，请检查用户名或UID"}), 404
 
-        # 获取搭子的旅行历史
-        shared_plans = []
-        if buddy["travel_history"]:
-            try:
-                shared_plans = json.loads(buddy["travel_history"])
-            except json.JSONDecodeError:
-                pass
+        # 只展示搭子「主动开启分享」的行程，其余保持私密
+        shared_plans = [
+            {k: t[k] for k in ("id", "title", "city", "days", "stops", "date", "start_date", "share_token")}
+            for t in trips_repo.list_trips(buddy["id"])
+            if t["shared"]
+        ]
 
         return jsonify({
             "buddy": {
@@ -85,6 +87,7 @@ def sync_buddy():
 
 
 @buddy_bp.route("/search", methods=["GET"])
+@login_required
 def search_buddy():
     """
     搜索搭子（模糊匹配用户名）

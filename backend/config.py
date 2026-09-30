@@ -55,8 +55,14 @@ class Config:
     DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-pro-260215")  # pro版联网搜索更稳定
     HAS_DOUBAO = bool(DOUBAO_API_KEY)
 
-    # AMap
+    # AMap（高德）—— JS API Key / 安全密钥属于「前端公开配置」，由 /api/config 下发，
+    # 不再写死在 index.html 里；建议在高德控制台为其绑定域名白名单。
     AMAP_KEY = os.getenv("AMAP_KEY", "")
+    AMAP_JS_KEY = os.getenv("AMAP_JS_KEY", "f82fd3115909f6cda7b1378ff7b2e3cb")
+    AMAP_SECURITY_CODE = os.getenv("AMAP_SECURITY_CODE", "b01d7d9e9a0316af03bd430f49d8def7")
+
+    # CORS：默认仅同源（前后端同域部署）。需要跨域时用逗号分隔填写来源。
+    CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
     # Database
     DB_PATH = os.getenv("DB_PATH", os.path.join(

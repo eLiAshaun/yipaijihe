@@ -8,7 +8,8 @@ Step 4: LLM 景点提取（不截断文本）
 import sys
 import json
 import tempfile
-sys.path.insert(0, ".")
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from backend.config import Config
 

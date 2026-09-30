@@ -1,31 +1,26 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# 一拍迹合 · 一键启动：创建虚拟环境 → 安装依赖 → 启动服务
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# 旅搭子 - 启动脚本
+command -v python3 >/dev/null || { echo "❌ 未找到 python3，请先安装 Python 3.10+"; exit 1; }
 
-echo "🚀 启动旅搭子..."
-echo ""
+if [ ! -d .venv ]; then
+  echo "📦 创建虚拟环境 .venv ..."
+  python3 -m venv .venv
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
 
-# 检查 Python 环境
-if ! command -v python3 &> /dev/null; then
-    echo "❌ 未找到 Python3，请先安装"
-    exit 1
+if ! python -c "import flask" 2>/dev/null; then
+  echo "📦 安装依赖 ..."
+  pip install -q -r requirements.txt
 fi
 
-# 检查依赖
-if ! python3 -c "import flask" 2>/dev/null; then
-    echo "📦 安装依赖..."
-    pip3 install -r requirements.txt
-fi
-
-# 检查 .env
 if [ ! -f .env ]; then
-    echo "📝 未找到 .env 文件，使用 Demo 模式（无 LLM）"
-    echo "   如需 LLM 支持，请复制 .env.example 为 .env 并配置 API Key"
-    echo ""
+  echo "📝 未找到 .env，将以 Demo 模式运行（无 LLM / 语音转写，景点与路线使用内置数据）"
+  echo "   需要 AI 能力请：cp .env.example .env 并填写 Key"
 fi
 
-echo "✅ 启动完成！"
-echo "🌐 访问 http://localhost:5000"
-echo ""
-
-python3 app.py
+echo "🌐 http://localhost:${FLASK_PORT:-5000}"
+exec python app.py
