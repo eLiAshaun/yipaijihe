@@ -3,7 +3,7 @@ import { icon } from "../core/icons.js";
 import { api } from "../core/api.js";
 import { state, persistDraft } from "../core/state.js";
 import { toast, toastError } from "../ui/toast.js";
-import { nudgeChat, addMessage } from "../ui/chat.js";
+import { nudgeChat, addMessage, closeChatIfIdle } from "../ui/chat.js";
 
 /** 从粘贴的分享文案里抽出 URL（抖音分享文案常夹杂中文标点） */
 export function extractUrls(text) {
@@ -84,6 +84,7 @@ export default {
         state.selectedIds = new Set(state.places.map((l) => l.id));
         persistDraft();
         if (state.places.length) addMessage("ai", `分析完成 ✅ 成功处理 ${data.success_count || 0}/${urls.length} 个视频，提取了 ${state.places.length} 个景点。\n\n可以继续问我这些景点的问题，或点击「进入地点筛选」。`);
+        setTimeout(closeChatIfIdle, 2500);
         if (!ctx.alive()) return;
         bar.firstChild.style.width = "100%";
         list.querySelectorAll("li").forEach((li) => (li.className = "done"));

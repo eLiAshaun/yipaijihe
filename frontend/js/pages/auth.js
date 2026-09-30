@@ -2,7 +2,7 @@ import { h } from "../core/dom.js";
 import { icon } from "../core/icons.js";
 import { decoImg } from "../core/config.js";
 import { login, register } from "../services/auth.js";
-import { state } from "../core/state.js";
+import { state, storage } from "../core/state.js";
 import { toast } from "../ui/toast.js";
 
 export default {
@@ -43,9 +43,9 @@ export default {
         try {
           await (isRegister ? register(u, pass.value) : login(u, pass.value));
           toast(isRegister ? `注册成功，欢迎 ${u}！先来测测你的旅行人格` : `欢迎回来，${u}`);
-          const pending = sessionStorage.getItem("ypjh_pending_share");
+          const pending = storage.get("ypjh_pending_share");
           if (pending) {
-            sessionStorage.removeItem("ypjh_pending_share");
+            storage.del("ypjh_pending_share");
             return ctx.navigate("shared", { token: pending });
           }
           ctx.navigate(state.persona ? "plan" : "persona");

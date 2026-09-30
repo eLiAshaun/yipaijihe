@@ -130,6 +130,11 @@ export function nudgeChat(message) {
   else fab.classList.add("is-nudging");
 }
 
+/** 长任务结束后，若用户没和搭子聊过，就把自动弹出的抽屉收起，别挡住主操作 */
+export function closeChatIfIdle() {
+  if (open && !state.chatHistory.some((m) => m.role === "user")) setChatOpen(false);
+}
+
 export function initChat() {
   const root = document.getElementById("chat-root");
   list = h("div", { class: "chat-list", role: "log", "aria-live": "polite" });

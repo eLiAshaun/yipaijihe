@@ -1,5 +1,5 @@
 import { state, bus, loadDraft, applyDraft } from "./core/state.js";
-import { startRouter, navigate, ROUTES, parseHash } from "./core/router.js";
+import { startRouter, navigate, ROUTES, parseHash, replaceHash } from "./core/router.js";
 import { restoreSession, logout } from "./services/auth.js";
 import { initHeader } from "./ui/header.js";
 import { initChat } from "./ui/chat.js";
@@ -25,7 +25,7 @@ async function boot() {
   // 未指定 hash 时按状态选择落点
   if (!parseHash() || location.hash === "#/" || !location.hash) {
     const target = !state.user ? "login" : !state.persona ? "persona" : draft?.itinerary?.days?.length ? "itinerary" : "plan";
-    history.replaceState(null, "", "#" + ROUTES[target].path);
+    replaceHash("#" + ROUTES[target].path);
   }
 
   await startRouter();

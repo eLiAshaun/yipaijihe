@@ -37,6 +37,15 @@ export function href(name, params = {}) {
   return "#" + r.path.replace(/:([a-z]+)/gi, (_, k) => encodeURIComponent(params[k]));
 }
 
+/** 在受限环境（沙箱 iframe / 部分内置浏览器）里 history.replaceState 可能抛错，降级为改 hash */
+export function replaceHash(target) {
+  try {
+    history.replaceState(null, "", target);
+  } catch {
+    location.hash = target;
+  }
+}
+
 export function navigate(name, params, { replace = false } = {}) {
   const target = href(name, params);
   if (location.hash === target) return render();
@@ -61,7 +70,7 @@ async function render() {
   const redirect = resolveGuard(route);
   if (redirect) {
     route = { name: redirect, params: {} };
-    history.replaceState(null, "", href(redirect));
+    replaceHash(href(redirect));
   }
 
   const def = ROUTES[route.name];

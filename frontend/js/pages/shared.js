@@ -1,7 +1,7 @@
 import { h, mountInto } from "../core/dom.js";
 import { icon, typeIcon, typeLabel } from "../core/icons.js";
 import { api } from "../core/api.js";
-import { state, bus, persistDraft } from "../core/state.js";
+import { state, bus, persistDraft, storage } from "../core/state.js";
 import { dayColorVar, dayHex } from "../core/config.js";
 import { createMapView } from "../services/map.js";
 import { daySegments, dayStats, dayDate, fmtDate, fmtDuration, hasCoords, stopLocation, stopName, TRAVEL_MODES, estimateCost } from "../services/planner.js";
@@ -25,7 +25,7 @@ export default {
 
       const copy = () => {
         if (!state.user) {
-          sessionStorage.setItem("ypjh_pending_share", ctx.params.token);
+          storage.set("ypjh_pending_share", ctx.params.token);
           toast("登录后即可复制为自己的行程");
           return ctx.navigate("login");
         }
