@@ -97,27 +97,11 @@ _WEATHER_CACHE = {}
 _WEATHER_TTL = 30 * 60
 
 
-_GEO_CACHE = {}
-
-
 def _geocode(city: str):
     """城市名 → 坐标（Open-Meteo 地理编码，免 Key）。用于没有内置景点库的城市查天气。"""
-    if city in _GEO_CACHE:
-        return _GEO_CACHE[city]
-    try:
-        resp = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "zh", "format": "json"},
-            timeout=5,
-        )
-        resp.raise_for_status()
-        hit = (resp.json().get("results") or [None])[0]
-        coords = (hit["latitude"], hit["longitude"]) if hit else None
-    except Exception as e:  # noqa: BLE001
-        logger.warning("城市地理编码失败: %s", e)
-        return None
-    _GEO_CACHE[city] = coords
-    return coords
+    from backend.services.geo import city_center
+
+    return city_center(city)
 
 
 @weather_bp.get("")

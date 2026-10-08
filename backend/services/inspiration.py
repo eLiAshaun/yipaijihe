@@ -33,10 +33,16 @@ def _aliases(name: str) -> list[str]:
 
 
 def _snippet(text: str, start: int, end: int) -> str:
-    """原文中提到地点的那一句"""
+    """原文中提到地点的那一句；长句（一逗到底的游记）只取提到它的分句，并带上后一个分句作上下文"""
     left = max(text.rfind(ch, 0, start) for ch in "。！？!?\n；;") + 1
     rights = [i for i in (text.find(ch, end) for ch in "。！？!?\n；;") if i != -1]
     right = min(rights) if rights else len(text)
+    if right - left > 40:
+        left = max([left] + [text.rfind(ch, left, start) + 1 for ch in "，," if text.rfind(ch, left, start) != -1])
+        cuts = sorted(i for ch in "，," for i in [text.find(ch, end, right)] if i != -1)
+        if cuts:
+            nxt = [i for ch in "，," for i in [text.find(ch, cuts[0] + 1, right)] if i != -1]
+            right = min(nxt) if nxt and cuts[0] - left < 16 else cuts[0]
     sentence = re.sub(r"https?://\S+", "", text[left:right])
     # 去掉抖音分享文案里的模板噪音：「5.8 复制打开抖音，看看【xx的作品】」「复制此链接」等
     sentence = re.sub(r"^\s*\d+(\.\d+)?\s*", "", sentence)
@@ -63,34 +69,29 @@ def extract_places(text: str, city: str, catalog: list[dict], use_llm: bool = Tr
         item["_pos"] = start
         found[key] = item
 
-    # 1) 景点库（长别名优先，避免「武康路」盖掉「武康路·武康大楼」）
-    alias_map = []
-    for loc in catalog:
-        for a in _aliases(loc["name"]):
-            alias_map.append((a, loc))
-    alias_map.sort(key=lambda x: len(x[0]), reverse=True)
-    for alias, loc in alias_map:
-        for m in re.finditer(re.escape(alias), text, re.IGNORECASE if alias.isascii() else 0):
-            add(loc, m.start(), m.end())
-
-    # 2) 常见地名坐标表（目前覆盖上海）
+    # 1) 景点库 + 常见地名表（目前覆盖上海）一起按名称从长到短匹配：
+    #    「北外滩」优先于「外滩」，「武康路·武康大楼」优先于「武康路」，短名落在长名里面的不再单独算
+    candidates = [(a, loc) for loc in catalog for a in _aliases(loc["name"])]
     if city == "上海":
         from backend.routes.video import _SHANGHAI_COORD_FALLBACK, _infer_type_from_keywords, _keywords_for_rule_location
 
         catalog_names = " ".join(l["name"] for l in catalog)
-        for name, (lat, lng) in sorted(_SHANGHAI_COORD_FALLBACK.items(), key=lambda x: len(x[0]), reverse=True):
+        for name, (lat, lng) in _SHANGHAI_COORD_FALLBACK.items():
             if name in catalog_names:  # 已被景点库覆盖
                 continue
-            for m in re.finditer(re.escape(name), text):
-                kws = _keywords_for_rule_location(name)
-                add({"id": f"gaz_{name}", "name": name, "lat": lat, "lng": lng, "type": _infer_type_from_keywords(kws), "keywords": kws, "tags": kws}, m.start(), m.end())
+            kws = _keywords_for_rule_location(name)
+            candidates.append((name, {"id": f"gaz_{name}", "name": name, "lat": lat, "lng": lng, "type": _infer_type_from_keywords(kws), "keywords": kws, "tags": kws}))
+    candidates.sort(key=lambda x: len(x[0]), reverse=True)
+    for alias, loc in candidates:
+        for m in re.finditer(re.escape(alias), text, re.IGNORECASE if alias.isascii() else 0):
+            add(loc, m.start(), m.end())
 
     # 3) 大模型补充（只接受原文里确实出现过的名字）
     if use_llm and Config.HAS_LLM and len(text) >= 6:
         try:
             from backend.routes.video import _extract_locations_from_text
 
-            for loc in _extract_locations_from_text(text, "", ""):
+            for loc in _extract_locations_from_text(text, "", "", city):
                 name = (loc.get("name") or "").strip()
                 pos = text.find(name) if name else -1
                 if pos >= 0:

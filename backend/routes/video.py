@@ -1,6 +1,6 @@
 """
-视频分析路由 - 接收用户粘贴的视频链接，调用 agent-reach 进行语音转写 + LLM 提取
-支持并行处理多个视频
+视频分析路由：接收抖音链接 → 听语音（本地 Whisper / MiMo）+ 看画面（多模态大模型）→ 识别地点
+支持同步（/analyze）与异步任务（/jobs，可轮询每条视频的进度）
 """
 
 from __future__ import annotations
@@ -8,10 +8,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 from backend.config import Config
 from backend.routes.auth import login_required
 
@@ -69,454 +69,281 @@ def _context_for(url: str, share_text: str) -> str:
     return ""
 
 
-def _process_single_video(url: str, index: int, total: int, mbti: str, share_text: str = "", city: str = "上海", catalog: list | None = None) -> dict:
+_STEP_LABEL = {"title": "读了标题", "asr": "听了语音", "vision": "看了画面"}
+
+
+def _process_single_video(url: str, index: int, total: int, mbti: str, share_text: str = "", city: str = "上海", catalog: list | None = None, progress=None) -> dict:
     """
     处理单个视频（在线程中运行）：
-      · 配置了语音转写（MIMO_API_KEY）：下载 → 转写 → 提取地点
-      · 没配置或转写失败：读取作品标题 / 文案 + 用户粘贴的分享文案 → 提取地点
+      读取作品信息 → 下载 → 听语音（本地 Whisper / MiMo）+ 看画面（多模态大模型）→ 从「标题 + 文案 + 转写 + 画面文字」里识别地点
+    任何一步失败都继续往下走，最后至少还有用户粘贴的分享文案可用。
     """
     from backend.services.inspiration import extract_places
+    from backend.services.video_processor import VideoProcessor
+    from backend.services import vision
 
+    step = progress or (lambda *_: None)
     url = url.strip()
-    base = {"index": index, "url": url, "title": "", "transcript": None, "locations": [], "error": None, "mode": ""}
+    base = {"index": index, "url": url, "title": "", "transcript": None, "screen": "", "locations": [], "error": None, "mode": "", "notes": []}
     logger.info(f"[{index+1}/{total}] 开始处理视频: {url}")
 
-    asr_err = ""
-    if Config.HAS_ASR:
-        transcript, video_title, asr_err = _transcribe_video(url)
-        if transcript:
-            locations = _extract_locations_from_text(transcript, video_title, mbti)
-            return {**base, "success": True, "title": video_title, "transcript": transcript, "locations": locations, "mode": "asr"}
-
-    title, title_err = "", ""
+    hints = [l["name"] for l in (catalog or [])][:60]
+    got, load_err = {"title": "", "transcript": "", "seen": {"text": [], "places": []}, "steps": [], "notes": []}, ""
     try:
-        from backend.services.video_processor import VideoProcessor
+        got = VideoProcessor().understand(url, city, hints, step)
+    except Exception as e:  # noqa: BLE001 — 网络 / 链接失效 / 抖音限制
+        load_err = str(e)[:80]
+    transcript = got["transcript"]
+    if transcript and Config.HAS_LLM:
+        step("校对转写")
+        from backend.services.llm_service import polish_transcript
 
-        title = VideoProcessor().fetch_title(url)
-    except Exception as e:  # noqa: BLE001 — 网络 / 链接失效
-        title_err = str(e)[:80]
-    text = "\n".join(t for t in (title, _context_for(url, share_text)) if t)
-    locations = extract_places(text, city, catalog or [])
+        # 画面上的字幕 / 招牌是写对了的地名，比景点库更贴近这条视频，优先作为改错依据
+        seen_names = [p["name"] for p in got["seen"]["places"]] + got["seen"]["text"][:20]
+        transcript = polish_transcript(transcript, city, seen_names + hints)
+    screen = vision.as_text(got["seen"])
+
+    step("识别地点")
+    text = "\n".join(t for t in (got["title"], _context_for(url, share_text), transcript, screen) if t)
+    locations = extract_places(text, city, catalog or []) if text.strip() else []
     if locations:
+        from backend.services.geo import fill_missing
+
+        fill_missing(locations, city)
         for loc in locations:
             loc["source"] = "video"
-        return {**base, "success": True, "title": title, "locations": locations, "mode": "title"}
+    mode = "+".join(got["steps"]) or "share_text"
+    info = {**base, "title": got["title"], "transcript": transcript or None, "screen": screen, "mode": mode, "notes": got["notes"], "done": [_STEP_LABEL[s] for s in got["steps"]]}
+    if locations:
+        return {**info, "success": True, "locations": locations}
 
     reasons = []
-    if asr_err:
-        reasons.append(f"语音转写失败（{asr_err[:60]}）")
-    elif not Config.HAS_ASR:
-        reasons.append("未配置语音转写，只能读取标题和文案")
-    if title_err:
-        reasons.append(f"读取视频标题失败（{title_err}）")
-    elif title:
-        reasons.append(f"标题「{title[:30]}」里没有具体地点")
-    return {**base, "success": False, "title": title, "error": "；".join(reasons) or "没有识别到具体地点", "mode": "title"}
+    if load_err:
+        reasons.append(f"读取视频失败（{load_err}）")
+    elif got["title"]:
+        reasons.append(f"「{got['title'][:30]}」" + ("、语音和画面" if transcript or screen else "") + "里没有具体地点")
+    reasons += got["notes"]
+    return {**info, "success": False, "error": "；".join(reasons) or "没有识别到具体地点"}
+
+
+def _load_catalog(city: str) -> list:
+    from backend.database import get_db as _get_db
+    from backend.routes.itinerary import _db_row_to_location
+
+    db = _get_db()
+    try:
+        return [_db_row_to_location(r) for r in db.execute("SELECT * FROM attractions WHERE city = ?", (city,)).fetchall()]
+    finally:
+        db.close()
+
+
+def _parse_request(data) -> tuple[dict | None, tuple | None]:
+    """校验请求，返回 (参数, 错误响应)"""
+    if not data or not data.get("urls"):
+        return None, (jsonify({"error": "请提供视频链接"}), 400)
+    if not isinstance(data["urls"], list):
+        return None, (jsonify({"error": "urls 需要是链接数组"}), 400)
+    urls = [u.strip() for u in data["urls"] if isinstance(u, str) and u.strip()]
+    if not urls:
+        return None, (jsonify({"error": "请提供有效的视频链接"}), 400)
+    if len(urls) > MAX_VIDEO_URLS:
+        return None, (jsonify({"error": f"一次最多分析 {MAX_VIDEO_URLS} 个视频"}), 400)
+    bad = [u for u in urls if not is_allowed_video_url(u)]
+    if bad:
+        return None, (jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）", "invalid": bad[:3]}), 400)
+    return {
+        "urls": urls,
+        "mbti": (data.get("personality") or {}).get("mbti", ""),
+        "share_text": str(data.get("text") or "")[:20000],
+        "city": str(data.get("city") or "上海")[:20],
+    }, None
+
+
+def _run_analysis(params: dict, on_progress=None) -> dict:
+    """并行处理所有视频并汇总；on_progress(index, stage) 用于任务进度"""
+    urls, city = params["urls"], params["city"]
+    catalog = _load_catalog(city)
+    logger.info(f"收到 {len(urls)} 个视频链接，开始并行分析...")
+    futures = {
+        _executor.submit(
+            _process_single_video, url, i, len(urls), params["mbti"], params["share_text"], city, catalog,
+            (lambda stage, i=i: on_progress(i, stage)) if on_progress else None,
+        ): i
+        for i, url in enumerate(urls)
+    }
+    results = [None] * len(urls)
+    for future in as_completed(futures):
+        idx = futures[future]
+        try:
+            results[idx] = future.result()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"视频 {idx+1} 处理异常: {e}")
+            results[idx] = {"index": idx, "success": False, "url": urls[idx], "title": "", "transcript": None, "locations": [], "error": "处理异常，请稍后重试"}
+        if on_progress:
+            on_progress(idx, "完成" if results[idx]["success"] else "没有识别到地点")
+
+    all_locations, transcripts, errors = [], [], []
+    for r in results:
+        if r["success"]:
+            transcripts.append({"url": r["url"], "title": r["title"], "text": r["transcript"], "screen": r.get("screen", ""), "mode": r.get("mode"), "done": r.get("done", []), "notes": r.get("notes", [])})
+            all_locations.extend(r["locations"])
+        else:
+            errors.append({"url": r["url"], "error": r["error"]})
+
+    seen, unique = set(), []
+    for loc in all_locations:
+        key = loc["name"].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(loc)
+    logger.info(f"分析完成：{len(transcripts)}/{len(urls)} 个视频成功，提取 {len(unique)} 个景点")
+
+    # 有坐标的新地点存进该城市的景点库（下次识别、生成行程时可直接用）
+    from backend.services.catalog import upsert_places
+
+    upsert_places(city, [dict(l) for l in unique if l.get("lat") is not None and not str(l.get("id", "")).startswith("loc_")], category="视频推荐")
+
+    from backend.services import asr
+
+    return {
+        "locations": unique,
+        "transcripts": transcripts,
+        "summary": f"从 {len(urls)} 个视频中提取了 {len(unique)} 个景点",
+        "video_count": len(urls),
+        "success_count": len(transcripts),
+        "total_locations": len(unique),
+        "errors": errors,
+        "asr": asr.status()["ready"],
+        "vision": Config.HAS_VISION,
+    }
 
 
 @video_bp.route("/analyze", methods=["POST"])
 @login_required
 def analyze_video():
     """
-    分析用户提供的视频链接（并行处理）
-
-    请求体：
-    {
-        "urls": ["https://v.douyin.com/xxxxx", ...],
-        "personality": { "mbti": "DRPC", "personality_name": "..." }
-    }
+    同步分析（等全部完成再返回）。请求体：{"urls": [...], "text": "原始分享文案", "city": "上海", "personality": {"mbti": "DRPC"}}
+    视频多、要听语音时建议用 POST /api/video/jobs + 轮询，能看到每条视频的进度。
     """
-    data = request.get_json()
-    if not data or not data.get("urls"):
-        return jsonify({"error": "请提供视频链接"}), 400
+    params, err = _parse_request(request.get_json(silent=True))
+    if err:
+        return err
+    return jsonify(_run_analysis(params))
 
-    if not isinstance(data["urls"], list):
-        return jsonify({"error": "urls 需要是链接数组"}), 400
-    urls = [u.strip() for u in data["urls"] if isinstance(u, str) and u.strip()]
-    if len(urls) > MAX_VIDEO_URLS:
-        return jsonify({"error": f"一次最多分析 {MAX_VIDEO_URLS} 个视频"}), 400
-    bad = [u for u in urls if not is_allowed_video_url(u)]
-    if bad:
-        return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）", "invalid": bad[:3]}), 400
-    personality = data.get("personality", {})
-    mbti = personality.get("mbti", "")
-    share_text = str(data.get("text") or "")[:20000]
-    city = str(data.get("city") or "上海")[:20]
-    from backend.database import get_db as _get_db
-    from backend.routes.itinerary import _db_row_to_location
 
-    _db = _get_db()
-    try:
-        catalog = [_db_row_to_location(r) for r in _db.execute("SELECT * FROM attractions WHERE city = ?", (city,)).fetchall()]
-    finally:
-        _db.close()
+@video_bp.route("/jobs", methods=["POST"])
+@login_required
+def create_job():
+    """异步分析：立即返回 job_id，前端轮询 GET /api/video/jobs/<id> 查看每条视频进行到哪一步"""
+    from backend.services import jobs
 
-    if not urls:
-        return jsonify({"error": "请提供有效的视频链接"}), 400
+    params, err = _parse_request(request.get_json(silent=True))
+    if err:
+        return err
+    job_id = jobs.create(owner=g.user["id"], items=[{"url": u, "stage": "排队中"} for u in params["urls"]])
 
-    logger.info(f"收到 {len(urls)} 个视频链接，开始并行分析...")
-
-    # 并行提交所有视频处理任务
-    futures = {
-        _executor.submit(_process_single_video, url, i, len(urls), mbti, share_text, city, catalog): i
-        for i, url in enumerate(urls)
-    }
-
-    # 收集结果（按完成顺序）
-    results = [None] * len(urls)
-    for future in as_completed(futures):
+    def run():
         try:
-            result = future.result()
-            results[result["index"]] = result
-        except Exception as e:
-            idx = futures[future]
-            logger.error(f"视频 {idx+1} 处理异常: {e}")
-            results[idx] = {
-                "index": idx, "success": False, "url": urls[idx],
-                "title": "", "transcript": None, "locations": [],
-                "error": f"处理异常: {str(e)}",
-            }
+            result = _run_analysis(params, lambda i, stage: jobs.update_item(job_id, i, stage))
+            jobs.finish(job_id, result)
+        except Exception:  # noqa: BLE001
+            logger.exception("视频分析任务失败")
+            jobs.fail(job_id, "分析失败，请稍后重试")
 
-    # 汇总结果
-    all_locations = []
-    transcripts = []
-    errors = []
+    threading.Thread(target=run, name=f"video-job-{job_id[:6]}", daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
 
-    for r in results:
-        if r is None:
-            continue
-        if r["success"]:
-            transcripts.append({"url": r["url"], "title": r["title"], "text": r["transcript"], "mode": r.get("mode")})
-            all_locations.extend(r["locations"])
-        else:
-            errors.append({"url": r["url"], "error": r["error"]})
 
-    # 去重（按景点名称）
-    seen = set()
-    unique_locations = []
-    for loc in all_locations:
-        key = loc["name"].strip().lower()
-        if key not in seen:
-            seen.add(key)
-            unique_locations.append(loc)
+@video_bp.route("/jobs/<job_id>", methods=["GET"])
+@login_required
+def get_job(job_id):
+    from backend.services import jobs
 
-    logger.info(f"分析完成：{len(transcripts)}/{len(urls)} 个视频成功，提取 {len(unique_locations)} 个景点")
-
-    # 持久化到数据库（作为预备默认景点）
-    saved_count = _save_locations_to_db(unique_locations)
-    if saved_count > 0:
-        logger.info(f"已将 {saved_count} 个新景点写入数据库")
-
-    return jsonify({
-        "locations": unique_locations,
-        "transcripts": transcripts,
-        "summary": f"从 {len(urls)} 个视频中提取了 {len(unique_locations)} 个景点",
-        "video_count": len(urls),
-        "success_count": len(transcripts),
-        "total_locations": len(unique_locations),
-        "errors": errors,
-        "asr": Config.HAS_ASR,
-    })
+    job = jobs.get(job_id)
+    if not job or job["owner"] != g.user["id"]:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    return jsonify({k: v for k, v in job.items() if k != "owner"})
 
 
 @video_bp.route("/transcribe", methods=["POST"])
 @login_required
 def transcribe_single():
     """
-    单个视频转写（用于实时进度展示）
-
-    请求体：{ "url": "https://v.douyin.com/xxxxx" }
+    单个视频：只返回听到的语音和看到的画面文字，不识别地点。请求体：{ "url": "https://v.douyin.com/xxxxx", "city": "上海" }
     """
-    data = request.get_json()
-    if not data or not data.get("url"):
-        return jsonify({"error": "请提供视频链接"}), 400
+    from backend.services import vision
+    from backend.services.video_processor import VideoProcessor
 
-    url = data["url"].strip()
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "请提供视频链接"}), 400
     if not is_allowed_video_url(url):
         return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）"}), 400
-    transcript, video_title, err_msg = _transcribe_video(url)
-
-    if not transcript:
-        return jsonify({"error": err_msg or "语音转写失败", "url": url}), 500
-
-    return jsonify({
-        "url": url,
-        "title": video_title,
-        "transcript": transcript,
-    })
-
-
-def _call_mcporter(tool: str, args: dict, timeout: int = 120) -> tuple[dict | str | None, str]:
-    """
-    调用 mcporter CLI 执行 MCP 工具
-
-    Args:
-        tool: 工具名，如 "douyin.parse_douyin_video_info"
-        args: 参数字典
-        timeout: 超时秒数
-
-    Returns:
-        (result, error_msg) — 成功时 (parsed_data, "")，失败时 (None, error_message)
-    """
-    # mcporter 配置文件路径
-    import os
-    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config", "mcporter.json")
-
-    # mcporter --timeout 接收毫秒，Python timeout 接收秒
-    mcporter_timeout_ms = str(timeout * 1000)
-
-    cmd = ["mcporter", "--config", config_path, "call", tool, "--timeout", mcporter_timeout_ms]
-    for k, v in args.items():
-        cmd.append(f"{k}={v}")
-
+    city = str(data.get("city") or "")[:20]
     try:
-        logger.info(f"[mcporter] calling: {tool}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-
-        # mcporter 输出格式：JSON 包含 "result" 字段（字符串化的工具返回值）
-        output = result.stdout.strip()
-
-        # 先检查 stderr 是否有错误信息
-        stderr_text = result.stderr.strip()
-        if stderr_text:
-            logger.warning(f"[mcporter] stderr: {stderr_text}")
-
-        if result.returncode != 0 and not output:
-            return None, stderr_text or f"mcporter 退出码: {result.returncode}"
-
-        if not output:
-            return None, stderr_text or "mcporter 无输出"
-
-        # 解析 mcporter 的 JSON 包装
-        parsed = json.loads(output)
-
-        # mcporter 返回 {"result": "..."} 格式
-        if isinstance(parsed, dict) and "result" in parsed:
-            inner = parsed["result"]
-
-            # 检查是否是错误响应
-            if isinstance(inner, dict) and inner.get("status") == "error":
-                error_msg = inner.get("error", "未知错误")
-                logger.error(f"[mcporter] tool error: {error_msg}")
-                return None, error_msg
-
-            if isinstance(inner, str):
-                # 检查是否是错误消息
-                try:
-                    inner_parsed = json.loads(inner)
-                    if isinstance(inner_parsed, dict) and inner_parsed.get("status") == "error":
-                        error_msg = inner_parsed.get("error", "未知错误")
-                        logger.error(f"[mcporter] tool error: {error_msg}")
-                        return None, error_msg
-                    return inner_parsed, ""
-                except json.JSONDecodeError:
-                    return inner, ""  # 非 JSON 字符串（如转写文本）
-            return inner, ""
-
-        return parsed, ""
-
-    except subprocess.TimeoutExpired:
-        error_msg = f"处理超时（{timeout}秒），视频可能过大或网络不稳定"
-        logger.error(f"[mcporter] {error_msg}")
-        return None, error_msg
-    except json.JSONDecodeError as e:
-        error_msg = f"解析返回数据失败: {e}"
-        logger.error(f"[mcporter] {error_msg}")
-        return None, error_msg
-    except Exception as e:
-        error_msg = f"调用失败: {e}"
-        logger.error(f"[mcporter] {error_msg}")
-        return None, error_msg
+        got = VideoProcessor().understand(url, city, [l["name"] for l in _load_catalog(city)][:60] if city else [])
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"读取视频失败：{str(e)[:80]}", "url": url}), 502
+    if not (got["transcript"] or got["seen"]["text"]):
+        return jsonify({"error": "；".join(got["notes"]) or "没有听到语音，也没有看到画面文字", "url": url, "title": got["title"]}), 422
+    return jsonify({"url": url, "title": got["title"], "transcript": got["transcript"], "screen": vision.as_text(got["seen"]), "notes": got["notes"]})
 
 
-def _transcribe_video(url: str) -> tuple[str | None, str, str]:
+def _extract_locations_from_text(transcript: str, video_title: str, mbti: str, city: str = "") -> list:
     """
-    对视频进行语音转写（切片并行处理）
-
-    Returns:
-        (transcript_text, video_title, error_msg) — 转写失败时 (None, "", error_msg)
-    """
-    try:
-        from backend.services.video_processor import VideoProcessor
-        processor = VideoProcessor()
-        transcript, video_title, err_msg = processor.process_video(url)
-        if transcript:
-            return transcript, video_title, ""
-
-        logger.warning(f"[VideoProcessor] 主流程失败，降级到 mcporter: {err_msg}")
-        fallback_text, fallback_title, fallback_err = _transcribe_video_mcporter(url)
-        if fallback_text:
-            return fallback_text, fallback_title or video_title, ""
-
-        errors = []
-        if err_msg:
-            errors.append(f"主流程失败: {err_msg}")
-        if fallback_err:
-            errors.append(f"降级失败: {fallback_err}")
-        return None, video_title or fallback_title, "；".join(errors) or "语音转写失败"
-    except ImportError as e:
-        logger.warning(f"[VideoProcessor] 导入失败，降级到 mcporter: {e}")
-        return _transcribe_video_mcporter(url)
-    except Exception as e:
-        logger.error(f"[VideoProcessor] 处理异常，降级到 mcporter: {e}")
-        fallback_text, fallback_title, fallback_err = _transcribe_video_mcporter(url)
-        if fallback_text:
-            return fallback_text, fallback_title, ""
-        return None, fallback_title, f"主流程异常: {e}；降级失败: {fallback_err}"
-
-
-def _transcribe_video_mcporter(url: str) -> tuple[str | None, str, str]:
-    """
-    降级方案：通过 mcporter 调用（串行处理）
-    """
-    # 先解析视频信息获取标题
-    info, err = _call_mcporter("douyin.parse_douyin_video_info", {"share_link": url}, timeout=30)
-    video_title = ""
-    if info and isinstance(info, dict):
-        if info.get("status") == "success":
-            video_title = info.get("title", "")
-        elif info.get("status") == "error":
-            return None, "", info.get("error", "视频解析失败")
-
-    if err and not info:
-        return None, "", f"视频解析失败: {err}"
-
-    # 语音转写
-    result, err2 = _call_mcporter("douyin.extract_douyin_text", {"share_link": url}, timeout=300)
-
-    if err2 and not result:
-        return None, video_title, f"语音转写失败: {err2}"
-
-    if result and isinstance(result, str) and len(result) > 10:
-        return result, video_title, ""
-
-    if result and isinstance(result, dict):
-        text = result.get("text", "") or result.get("content", "")
-        if text and len(text) > 10:
-            return text, video_title, ""
-
-    return None, video_title, "未能从视频中提取到有效文本"
-
-
-def _extract_locations_from_text(transcript: str, video_title: str, mbti: str) -> list:
-    """
-    使用 LLM 从转写文本中提取具体可到访地点，并做后置过滤
+    使用 LLM 从文字（视频转写 / 画面文字 / 笔记）中提取具体可到访地点，并做后置过滤：
+    地点名必须在原文里出现过，城市、行政区、交通住宿、品类泛称一律丢弃。坐标不采用模型给的值，由地理编码补全。
     """
     from backend.services.llm_service import chat_completion, enrich_locations_travel_style_fit
 
-    # 不截断文本，完整送入 LLM
     rule_locations = _extract_locations_with_rules(transcript, video_title, mbti)
+    where = city or "当地"
+    prompt = f"""从下面这段{where}旅行内容中，提取**明确、具体、可到访**的地点。
 
-    prompt = f"""你是一个旅行信息提取专家。请从以下抖音旅行视频的语音转写文本中，提取**明确、具体、可到访**的地点。
+## 标题
+{video_title or "（无）"}
 
-## 视频标题
-{video_title}
-
-## 转写文本
+## 内容
 {transcript}
 
-## 提取规则（非常重要，请严格遵守）
+## 规则
+1. 地点名必须在标题或内容里原样出现（可以去掉「的」「这家」之类的修饰），是能真实前往的景点、街道、建筑、店铺、展馆、公园、码头等
+2. 不要输出：城市 / 行政区 / 区域泛称（{where}、市中心、附近）、交通和住宿泛称（地铁站、机场、酒店）、品类词（餐厅、咖啡店、景点、打卡点），以及内容没直接说出的推测地点
+3. 「A、B 漫步」要拆成 A 和 B；「某某三件套」只在内容明确说出各自名字时才拆
+4. reason：一句话概括内容里对这个地方说了什么（比如推荐的菜、拍照机位、注意事项），不要泛泛而谈
 
-1. **只提取明确具体地点**：地点名必须在标题或转写文本中明确出现，且是用户能真实前往的景点、街道、建筑、店铺、展馆、公园、码头等。
-
-2. **不要过度识别**：以下内容不要作为地点输出：
-   - 城市/行政区/区域泛称：上海、浦东、浦西、黄浦区、市中心、附近、周边
-   - 交通和住宿泛称：地铁、地铁站、公交站、机场、酒店、民宿、住处
-   - 普通品类词：餐厅、咖啡店、小店、商场、景点、打卡点、机位
-   - 文本没有直接说出的推测地点；不要因为“外滩夜景”就额外脑补一串周边地点
-
-3. **粒度原则**：
-   - "陆家嘴三件套"→ 可提取"陆家嘴"，以及文本明确围绕三件套介绍时的"上海环球金融中心""金茂大厦""上海中心大厦"
-   - "武康路、安福路漫步"→ 分别提取"武康路"和"安福路"
-   - "乍浦路桥上能拍到外白渡桥和东方明珠"→ 提取"乍浦路桥"，也可提取被明确提到的"外白渡桥""东方明珠"
-
-4. **坐标处理**：上海知名景点尽量给出经纬度，不确定的写 null（系统会自动补全）
-
-5. **reason 写法**：用一句话概括博主对这个地方说了什么，不要泛泛而谈
-
-## 输出格式
-
-严格输出 JSON 数组，不要任何其他文字。每个元素格式：
-```json
-{{
-  "name": "地点名称",
-  "type": "landmark|street|food|culture",
-  "keywords": ["关键词1", "关键词2", "关键词3"],
-  "reason": "博主对这个地点的一句话描述",
-  "lat": 31.2400,
-  "lng": 121.4900
-}}
-```
-
-type 分类说明：
-- landmark：地标建筑、景点、桥梁、广场
-- street：街道、路名、步行街、弄堂
-- food：餐厅、咖啡馆、小吃街、美食
-- culture：博物馆、美术馆、书店、寺庙、文创空间
-
-现在请提取："""
+只输出 JSON：{{"places": [{{"name": "地点名称", "type": "landmark|street|food|culture", "keywords": ["关键词1", "关键词2"], "reason": "内容里对它的描述"}}]}}"""
 
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是旅行信息提取专家。你的任务是从语音转写文本中提取明确具体、可到访的地点。"
-                "原则：宁可少一点，也不要把城市、区域、交通、住宿、普通品类词或推测地点误识别成景点。"
-                "只输出 JSON 数组，不要任何其他文字或解释。"
-            ),
-        },
+        {"role": "system", "content": "你是旅行信息提取专家。宁可少一点，也不要把城市、区域、交通、住宿、品类词或推测的地点误识别成景点。只输出合法 JSON。"},
         {"role": "user", "content": prompt},
     ]
-
-    # mimo-v2.5-pro 需要较多 tokens 用于 reasoning，必须给够
-    # 全量提取场景下可能产出 20+ 景点，给足 8000 tokens
-    result = chat_completion(messages, temperature=0.3, max_tokens=8000)
+    result = chat_completion(messages, temperature=0.2, max_tokens=4000, json_mode=True)
 
     source_text = f"{video_title}\n{transcript}"
     if not result:
         logger.warning("LLM 提取地点失败，使用本地规则兜底")
         return _filter_extracted_locations(rule_locations, source_text)
 
-    try:
-        # 提取 JSON
-        if "```json" in result:
-            result = result.split("```json")[1].split("```")[0]
-        elif "```" in result:
-            result = result.split("```")[1].split("```")[0]
+    from backend.services.llm_service import _extract_json_array
 
-        # 尝试解析，如果失败则尝试修复截断的 JSON
-        try:
-            locations = json.loads(result.strip())
-        except json.JSONDecodeError:
-            # 尝试修复截断的 JSON：找到最后一个完整的 } 并闭合数组
-            fixed = _repair_truncated_json(result.strip())
-            locations = json.loads(fixed)
+    locations = _extract_json_array(result)
+    if locations is None:
+        logger.error("LLM 提取结果解析失败: %r", result[:200])
+        return _filter_extracted_locations(rule_locations, source_text)
 
-        if not isinstance(locations, list):
-            return []
+    for loc in locations:
+        if not isinstance(loc, dict) or not loc.get("name"):
+            continue
+        loc["lat"] = loc["lng"] = None
+        loc["labels"] = _match_labels((loc.get("keywords") or [])[:3], mbti)
+        loc["source"] = loc.get("source") or "video"
 
-        # 为每个景点添加 MBTI 标签
-        for loc in locations:
-            if not isinstance(loc, dict) or not loc.get("name"):
-                continue
-            base_labels = loc.get("keywords", [])[:3]
-            loc["labels"] = _match_labels(base_labels, mbti)
-            loc["source"] = loc.get("source") or "video"
-
-        source_text = f"{video_title}\n{transcript}"
-        locations = [loc for loc in locations if isinstance(loc, dict) and loc.get("name")]
-        locations = _merge_locations(locations, rule_locations)
-        locations = _filter_extracted_locations(locations, source_text)
-        return enrich_locations_travel_style_fit(locations, video_title=video_title)
-
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"LLM 提取结果解析失败: {e}")
-        return _filter_extracted_locations(rule_locations, f"{video_title}\n{transcript}")
+    locations = [loc for loc in locations if isinstance(loc, dict) and loc.get("name") and loc["name"] not in (city, f"{city}市")]
+    locations = _merge_locations(locations, rule_locations)
+    locations = _filter_extracted_locations(locations, source_text)
+    return enrich_locations_travel_style_fit(locations, video_title=video_title)
 
 
 def _merge_locations(primary: list, fallback: list) -> list:
@@ -580,8 +407,10 @@ def _looks_like_specific_place(name: str, loc: dict) -> bool:
         return True
     if normalized_name.endswith(_NAMED_PLACE_SUFFIXES):
         return True
+    if loc.get("type") in ("food", "culture"):  # 店名、展馆名常常只有两三个字（「大壶春」「茂昌」）
+        return True
     keywords = " ".join(loc.get("keywords") or loc.get("tags") or [])
-    if any(word in keywords for word in ("美食", "咖啡", "面馆", "餐厅", "展览", "拍照", "citywalk")):
+    if any(word in keywords for word in ("美食", "咖啡", "面馆", "餐厅", "小吃", "老字号", "面包", "甜品", "展览", "拍照", "citywalk")):
         return True
     return len(normalized_name) >= 4
 
@@ -859,7 +688,6 @@ def _fill_coords(name: str, lat, lng):
         return _SHANGHAI_COORD_FALLBACK[name]
 
     # 模糊匹配：名称包含关系
-    name_lower = name.lower()
     for key, coords in _SHANGHAI_COORD_FALLBACK.items():
         if key in name or name in key:
             return coords

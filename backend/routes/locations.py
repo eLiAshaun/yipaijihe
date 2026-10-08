@@ -4,6 +4,7 @@
 
 import json
 from flask import Blueprint, jsonify, request
+from backend.config import Config
 from backend.database import get_db
 from backend.services.llm_service import discover_trip_attractions
 
@@ -125,9 +126,9 @@ def get_city_info():
 def default_recommend():
     """
     地点筛选页的候选地点：
-      · 开启联网搜索时：搜索「{城市}{天数}日游攻略」归纳高频地点，并按人格筛选
-      · 否则：使用该城市的完整内置景点库，按旅行人格契合度排序并给出契合理由
-    请求体：{ "profile": {...}, "city": "上海", "days": 3 }
+      · 开启联网搜索时：搜索「{城市}{天数}日游」攻略，大模型归纳地点并按人格预选，结果写入景点库
+      · 否则（或 web=false）：使用该城市的内置景点库，按旅行人格契合度排序并给出契合理由
+    请求体：{ "profile": {...}, "city": "上海", "days": 3, "web": true }
     """
     from backend.routes.itinerary import persona_score
 
@@ -139,9 +140,13 @@ def default_recommend():
     except (TypeError, ValueError):
         days = 3
 
-    attractions = discover_trip_attractions(city, days, profile)
-    if attractions:
-        return jsonify({"attractions": attractions, "source": "web_search", "message": "", "query_phrase": f"{city}{days}日游攻略"})
+    web, meta = ([], {})
+    if data.get("web", True):
+        web, meta = discover_trip_attractions(city, days, profile)
+        if web:
+            from backend.services.catalog import upsert_places
+
+            upsert_places(city, web)
 
     db = get_db()
     try:
@@ -149,11 +154,15 @@ def default_recommend():
         catalog = [_row_to_location(r) for r in rows]
     finally:
         db.close()
-    if not catalog:
+    if not catalog and not web:
         return jsonify({
             "attractions": [],
             "source": "none",
-            "message": f"「{city}」还没有内置景点库。在 .env 里配置 DOUBAO_API_KEY 开启联网搜索后即可规划，或者在下方手动添加地点。",
+            "message": (
+                f"「{city}」还没有内置景点库，联网搜索这次也没有拿到结果（请检查网络或大模型 Key），可以稍后重试，或在下方手动添加地点。"
+                if Config.HAS_WEB_SEARCH
+                else f"「{city}」还没有内置景点库。在 .env 里填上 DEEPSEEK_API_KEY 开启联网搜索后即可规划任意城市，或者在下方手动添加地点。"
+            ),
         })
 
     mbti = profile.get("mbti") or ""
@@ -166,6 +175,19 @@ def default_recommend():
         if mbti and score >= 6 and matched:
             loc["reason"] = f"契合你的{'、'.join(matched[:2])}偏好 · " + loc["reason"]
     catalog.sort(key=lambda l: l.get("fit_score", 0), reverse=True)
+    if web:
+        # 联网结果在前（已按人格预选）；景点库里其余的地点附在后面，默认不勾选，想加随时勾上
+        have = {p.get("id") for p in web} | {p["name"] for p in web}
+        extra = [dict(l, selected=False, source="builtin") for l in catalog if l["id"] not in have and l["name"] not in have]
+        mode = meta.get("mode")
+        return jsonify({
+            "attractions": web + extra,
+            "source": "web_search",
+            "mode": mode,
+            "sources": meta.get("sources") or [],
+            "message": "以下地点由大模型凭自身知识整理（当前网络搜不到资料），营业信息出发前请再确认。" if mode == "knowledge" else "",
+            "query_phrase": f"{city}{days}日游攻略",
+        })
     if mbti:
         # 预选：契合度高的全部选上；不够时按契合度补足到「每天 3 个」，避免行程太空
         enough = max(sum(1 for l in catalog if l["fit_score"] >= 6), days * 3)

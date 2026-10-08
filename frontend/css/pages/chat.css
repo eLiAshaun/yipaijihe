@@ -23,6 +23,8 @@
 .rt-list li::before { content: ""; position: absolute; left: 2px; top: 0.7em; width: 6px; height: 6px; border-radius: 50%; background: var(--seal); }
 .rt-gap { height: 6px; }
 .msg-suggest { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 42px; }
+.msg-sources { display: flex; flex-wrap: wrap; gap: 4px 10px; padding-left: 42px; font-size: var(--fs-xs); }
+.msg-sources a { color: var(--sea); text-underline-offset: 3px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thinking { display: inline-flex; gap: 5px; align-items: center; padding: 14px 16px; }
 .thinking i { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); animation: bounce 1.2s infinite ease-in-out both; }
 .thinking i:nth-child(2) { animation-delay: 0.15s; }

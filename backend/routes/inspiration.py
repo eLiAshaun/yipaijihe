@@ -28,5 +28,7 @@ def extract():
         catalog = [_db_row_to_location(r) for r in db.execute("SELECT * FROM attractions WHERE city = ?", (city,)).fetchall()]
     finally:
         db.close()
-    places = extract_places(text, city, catalog)
+    from backend.services.geo import fill_missing
+
+    places = fill_missing(extract_places(text, city, catalog), city)
     return jsonify({"places": places, "count": len(places)})

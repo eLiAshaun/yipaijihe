@@ -443,3 +443,10 @@ button.chip:hover { border-color: var(--ink); color: var(--ink); }
   transition: translate var(--dur-3) var(--ease), visibility 0s linear var(--dur-3);
 }
 .drawer.is-open { translate: 0 0; visibility: visible; transition-delay: 0s; }
+@media (min-width: 1100px) {
+  .view, .topbar { transition: margin-right var(--dur-3) var(--ease); }
+  .chat-docked .view, .chat-docked .topbar { margin-right: 440px; }
+  .chat-docked .action-bar { right: 440px; }
+  .chat-docked .toasts { left: calc((100% - 440px) / 2); }
+  .chat-docked .drawer { box-shadow: none; }
+}

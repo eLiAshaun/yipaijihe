@@ -49,9 +49,13 @@ function scrollDown() {
   list.scrollTop = list.scrollHeight;
 }
 
-export function addMessage(role, text, suggestions) {
+export function addMessage(role, text, suggestions, sources) {
   list.querySelector(".chat-welcome")?.remove();
   list.append(bubble(role, role === "ai" ? richText(text) : text));
+  if (sources?.length) {
+    list.append(h("div", { class: "msg-sources" }, h("span", { class: "faint" }, "联网查到的资料："),
+      sources.map((s) => h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer", title: s.title }, `[${s.n}] ${s.title.length > 22 ? `${s.title.slice(0, 22)}…` : s.title}`))));
+  }
   if (suggestions?.length) {
     list.append(h("div", { class: "msg-suggest" }, suggestions.map((s) => h("button", { class: "chip", type: "button", onclick: () => ask(s) }, s))));
   }
@@ -97,7 +101,7 @@ async function ask(text) {
     thinking.remove();
     const reply = data.reply || "抱歉，我暂时无法回答这个问题。";
     state.chatHistory.push({ role: "assistant", content: reply });
-    addMessage("ai", reply, data.suggestions);
+    addMessage("ai", reply, data.suggestions, data.sources);
   } catch (e) {
     thinking.remove();
     addMessage("ai", `出错了：${e.message}`);
@@ -113,8 +117,12 @@ function autosize() {
   input.style.height = Math.min(input.scrollHeight, 120) + "px";
 }
 
+/** 宽屏时抽屉停靠在右侧、页面让出位置，而不是盖住内容（顶栏的账号按钮、底部的主按钮） */
+const dock = () => document.documentElement.classList.toggle("chat-docked", open && innerWidth >= 1100);
+
 export function setChatOpen(v) {
   open = v;
+  dock();
   drawer.classList.toggle("is-open", open);
   drawer.toggleAttribute("inert", !open);
   fab.setAttribute("aria-expanded", String(open));
@@ -136,6 +144,7 @@ export function closeChatIfIdle() {
 }
 
 export function initChat() {
+  addEventListener("resize", dock);
   const root = document.getElementById("chat-root");
   list = h("div", { class: "chat-list", role: "log", "aria-live": "polite" });
   input = h("textarea", {

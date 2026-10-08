@@ -159,7 +159,7 @@ def test_default_recommend_without_web_search_uses_whole_catalog_ranked_by_perso
     assert any(a["selected"] for a in res["attractions"]) and not all(a["selected"] for a in res["attractions"])
 
     other = client.post("/api/locations/default-recommend", json={"city": "杭州"}).get_json()
-    assert other["attractions"] == [] and "DOUBAO_API_KEY" in other["message"]
+    assert other["attractions"] == [] and "DEEPSEEK_API_KEY" in other["message"]
 
 
 # ------------------------------------------------------------------ 灵感 ----
@@ -176,10 +176,10 @@ def test_inspiration_extracts_places_with_their_sentence(client, auth):
 def test_video_analyze_without_asr_reads_share_text_and_never_returns_demo_data(client, auth, monkeypatch):
     from backend.services import video_processor
 
-    def offline(self, url):
+    def offline(self, url, timeout=None):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr(video_processor.VideoProcessor, "fetch_title", offline)
+    monkeypatch.setattr(video_processor.VideoProcessor, "_load_share_item", offline)
     hdr = {"Authorization": auth["Authorization"]}
     share = "5.8 复制打开抖音，看看【小王的作品】上海一日游 武康路+外滩夜景 https://v.douyin.com/abc123/"
     res = client.post("/api/video/analyze", json={"urls": ["https://v.douyin.com/abc123/"], "text": share}, headers=hdr).get_json()

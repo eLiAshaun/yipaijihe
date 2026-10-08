@@ -98,6 +98,11 @@ def _text_of(c: dict) -> str:
     return " ".join([c.get("name", ""), c.get("category", ""), " ".join(c.get("tags") or []), c.get("description", "")])
 
 
+def intent_of(message: str) -> str:
+    """识别问题类型；没有命中任何关键词时为 summary（概览）"""
+    return next((name for name, words in INTENTS if any(w in message for w in words)), "summary")
+
+
 def reply(message: str, context: dict, catalog: list[dict]) -> tuple[str, list[str]]:
     message = (message or "").strip()
     context = context or {}
@@ -107,7 +112,7 @@ def reply(message: str, context: dict, catalog: list[dict]) -> tuple[str, list[s
     in_trip = {(_loc(it).get("name") or "") for _, it in _stops(itinerary)}
     focus, where = _focus(itinerary, trip, message, catalog)
     near = f"离{where}" if where else "在景点库里"
-    intent = next((name for name, words in INTENTS if any(w in message for w in words)), "summary")
+    intent = intent_of(message)
 
     if intent == "rain":
         rainy = [i for i, w in enumerate(weather) if isinstance(w, dict) and (w.get("rain_prob") or 0) >= 50]
@@ -204,7 +209,7 @@ def reply(message: str, context: dict, catalog: list[dict]) -> tuple[str, list[s
     stops = _stops(itinerary)
     if not stops:
         return ("我可以根据你的行程回答：附近吃什么、下一站怎么走、下雨换哪里、预算够不够。"
-                "先在「地点筛选」里选好地点生成路线，我会更有用。"), ["上海有什么好吃的", "适合拍照的地方"]
+                "先在「地点筛选」里选好地点生成路线，我会更有用。"), [f"{(context.get('trip') or {}).get('city') or '这里'}有什么好吃的", "适合拍照的地方"]
     days = len(itinerary.get("days") or [])
     lines = [f"你的行程共 {days} 天、{len(stops)} 站。可以问我："]
     lines += ["- **下一站怎么走**", "- **附近有什么好吃的 / 咖啡**", "- **下雨了怎么办**", "- **预算还剩多少**"]

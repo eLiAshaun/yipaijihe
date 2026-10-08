@@ -26,6 +26,40 @@ const hasWords = (text) => (text.match(/[一-龥A-Za-z]/g) || []).length >= 2;
 
 const SOURCE = { video: ["film", "来自视频"], inspiration: ["file", "来自文字"] };
 
+/** 告诉用户抖音视频会被怎样分析（听语音 / 看画面 / 只读标题） */
+function capText(c) {
+  const asr = c.asr_status || {};
+  const eye = c.vision ? "让大模型看画面里的字幕和招牌" : "";
+  let ear = "";
+  if (asr.engine === "mimo") ear = "用 MiMo 听视频讲解";
+  else if (asr.engine === "local" && asr.ready) ear = "用本地 Whisper 听视频讲解";
+  const parts = [ear, eye].filter(Boolean);
+  let text = parts.length ? `抖音视频会下载下来，${parts.join("，并")}，再识别其中的地点。` : "抖音视频会读取标题和你粘贴的文案来识别地点。";
+  if (asr.engine === "local" && !asr.ready) {
+    text += asr.state === "error" ? "（本地语音模型加载失败，暂时不听语音）" : `（本地语音模型正在后台准备${asr.progress != null ? ` ${asr.progress}%` : ""}，好了之后会自动开始听语音）`;
+  } else if (asr.engine === "none" && c.vision) {
+    text += "（安装 requirements-video.txt 后还能听语音）";
+  }
+  return text;
+}
+
+/** 后端阶段 → 进度（0-6） */
+const STAGE_STEP = { 排队中: 0, 读取视频信息: 1, 下载视频: 2, 看图片: 3, 听语音: 3, 校对转写: 4, 看画面: 4, 识别地点: 5, 完成: 6, 没有识别到地点: 6 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 提交视频分析任务并轮询进度；onItems 每次拿到最新的逐条进度 */
+async function runVideoJob(body, onItems, alive) {
+  const { job_id } = await api.post("/api/video/jobs", body);
+  for (;;) {
+    await sleep(1200);
+    if (!alive()) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+    const job = await api.get(`/api/video/jobs/${job_id}`);
+    onItems(job.items || [], job.elapsed || 0);
+    if (job.status === "done") return job.result;
+    if (job.status === "error") throw new Error(job.error || "视频分析失败");
+  }
+}
+
 export default {
   title: () => "灵感素材",
 
@@ -62,9 +96,7 @@ export default {
     getConfig().then((c) => {
       caps = c;
       if (!ctx.alive()) return;
-      capNote.textContent = c.asr
-        ? "已开启语音转写：会听抖音视频里的讲解来识别地点。"
-        : "未开启语音转写：会读取抖音视频的标题与你粘贴的文案识别地点（配置 MIMO_API_KEY 后可以听视频内容）。";
+      capNote.textContent = capText(c);
     }).catch(() => {});
 
     async function analyze() {
@@ -80,33 +112,39 @@ export default {
       analyzeBtn.disabled = true;
       results.replaceChildren();
 
-      const STAGES = douyin.length ? (caps.asr ? ["读取视频", "语音转写", "识别地点"] : ["读取视频标题", "识别地点"]) : ["识别地点"];
       const bar = h("div", { class: "progress" }, h("i"));
       const label = h("p", { class: "analysis-label" });
-      const list = h("ol", { class: "stages" }, STAGES.map((t) => h("li", null, h("span", { class: "stage-dot" }), t)));
+      const rows = h("ol", { class: "video-rows" }, douyin.map((u) => h("li", null, h("span", { class: "stage-dot" }), h("code", null, host(u)), h("span", { class: "video-stage" }, "排队中"))));
+      const textRow = hasWords(words) ? h("p", { class: "analysis-label" }, icon("file"), ` 正在识别 ${words.length} 字文字里的地点…`) : null;
       const head = [douyin.length && `${douyin.length} 个抖音视频`, hasWords(words) && `${words.length} 字文字`].filter(Boolean).join(" + ");
-      mountInto(stage, h("div", { class: "analysis-top" }, h("b", null, `正在分析 ${head}`), h("span", { class: "mono faint" }, douyin.length && caps.asr ? "预计 1–2 分钟" : "几秒钟")), bar, list, label);
+      const slow = douyin.length && (caps.asr || caps.vision);
+      mountInto(stage, h("div", { class: "analysis-top" }, h("b", null, `正在分析 ${head}`), h("span", { class: "mono faint" }, slow ? "每个视频约 0.5–2 分钟" : "几秒钟")), bar, douyin.length ? rows : null, textRow, label);
       stage.hidden = false;
-      if (douyin.length && caps.asr) nudgeChat(`正在分析 ${douyin.length} 个视频，需要 1–2 分钟 ⏳\n\n等的时候可以问我：\n- 这座城市有什么好吃的\n- 适合拍照的地方`);
+      if (slow) nudgeChat(`正在分析 ${douyin.length} 个视频（下载、听讲解、看画面），每个约 0.5–2 分钟 ⏳\n\n等的时候可以问我：\n- ${state.trip.city}有什么好吃的\n- 适合拍照的地方`);
 
-      let pct = 4;
       const t0 = Date.now();
+      let pct = 3;
       const tick = setInterval(() => {
-        pct = Math.min(pct + Math.random() * (caps.asr ? 5 : 18), 92);
+        if (!douyin.length) pct = Math.min(pct + 15, 92);
         bar.firstChild.style.width = `${pct}%`;
-        const cur = Math.min(STAGES.length - 1, Math.floor((pct / 100) * STAGES.length));
-        [...list.children].forEach((li, i) => {
-          li.classList.toggle("on", i === cur);
-          li.classList.toggle("done", i < cur);
-        });
-        label.textContent = `${STAGES[cur]}… 已用 ${Math.round((Date.now() - t0) / 1000)} 秒`;
+        label.textContent = `已用 ${Math.round((Date.now() - t0) / 1000)} 秒`;
       }, 700);
+      const onItems = (items) => {
+        const total = items.reduce((n, it) => n + (STAGE_STEP[it.stage] ?? 1), 0);
+        pct = Math.max(pct, Math.min(96, Math.round((total / (6 * items.length)) * 100)));
+        items.forEach((it, i) => {
+          const li = rows.children[i];
+          if (!li) return;
+          li.querySelector(".video-stage").textContent = it.stage;
+          li.className = STAGE_STEP[it.stage] >= 6 ? "done" : STAGE_STEP[it.stage] > 0 ? "on" : "";
+        });
+      };
 
       const p = state.persona;
       const city = state.trip.city;
       const jobs = [];
-      if (douyin.length) jobs.push(api.post("/api/video/analyze", { urls: douyin, text: raw, city, personality: p ? { mbti: p.mbti, personality_name: p.personality?.name } : {} }).then((d) => ({ kind: "video", d })));
-      if (hasWords(words)) jobs.push(api.post("/api/inspiration/extract", { text: words, city }).then((d) => ({ kind: "text", d })));
+      if (douyin.length) jobs.push(runVideoJob({ urls: douyin, text: raw, city, personality: p ? { mbti: p.mbti, personality_name: p.personality?.name } : {} }, onItems, ctx.alive).then((d) => ({ kind: "video", d })));
+      if (hasWords(words)) jobs.push(api.post("/api/inspiration/extract", { text: words, city }).then((d) => ((textRow && (textRow.textContent = `✓ 文字里找到 ${d.count} 个地点`)), { kind: "text", d })));
 
       try {
         const settled = await Promise.allSettled(jobs);
@@ -124,7 +162,7 @@ export default {
           seen.add(l.name);
           merged.push({ ...l, id: l.id || `insp_${i + 1}`, keywords: l.keywords || l.tags || [], reason: l.reason || "" });
         });
-        state.videoAnalysis = { errors: video?.errors || [], transcripts: video?.transcripts || [], others, asr: !!video?.asr, count: merged.length };
+        state.videoAnalysis = { errors: video?.errors || [], transcripts: video?.transcripts || [], others, asr: !!video?.asr, vision: !!video?.vision, count: merged.length };
         state.places = merged;
         state.selectedIds = new Set(merged.filter((l) => l.lat && l.lng).map((l) => l.id));
         persistDraft();
@@ -133,12 +171,11 @@ export default {
         setTimeout(closeChatIfIdle, 2500);
         if (!ctx.alive()) return;
         bar.firstChild.style.width = "100%";
-        list.querySelectorAll("li").forEach((li) => (li.className = "done"));
         label.textContent = `完成，用时 ${Math.round((Date.now() - t0) / 1000)} 秒`;
         setTimeout(() => ctx.alive() && ((stage.hidden = true), renderResults()), 500);
       } catch (e) {
         clearInterval(tick);
-        if (ctx.alive()) ((stage.hidden = true), toastError(e));
+        if (ctx.alive() && e.name !== "AbortError") ((stage.hidden = true), toastError(e));
       } finally {
         if (ctx.alive()) analyzeBtn.disabled = false;
       }
@@ -157,6 +194,11 @@ export default {
       mountInto(
         results,
         data.others?.length ? h("div", { class: "banner banner--info" }, icon("info"), `${data.others.length} 条非抖音链接（${data.others.map(host).slice(0, 2).join("、")}）无法直接读取，已分析你粘贴的文字`) : null,
+        data.transcripts?.length ? h("div", { class: "video-done" }, data.transcripts.map((t) => h("details", { class: "video-heard" },
+          h("summary", null, icon("film"), h("b", null, t.title ? `「${t.title.slice(0, 28)}」` : host(t.url)), h("span", { class: "faint" }, ` ${(t.done || []).join(" · ") || "读了你粘贴的文案"}`)),
+          (t.notes || []).map((n) => h("p", { class: "hint" }, n)),
+          t.text && h("p", null, h("b", null, "听到："), t.text.length > 400 ? `${t.text.slice(0, 400)}…` : t.text),
+          t.screen && h("p", null, h("b", null, "看到："), t.screen.length > 300 ? `${t.screen.slice(0, 300)}…` : t.screen)))) : null,
         data.errors?.length
           ? h("details", { class: "banner banner--err" }, h("summary", null, icon("alert"), `${data.errors.length} 个视频没有识别到地点`), h("ul", null, data.errors.map((e) => h("li", null, h("code", null, host(e.url || String(e))), "：", e.error || "处理失败"))), h("p", { class: "hint" }, "可以把视频标题或文案一起粘贴进来，或在下一步手动添加地点"))
           : null,

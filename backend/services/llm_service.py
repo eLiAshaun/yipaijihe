@@ -1,8 +1,8 @@
 """
 LLM 服务 - 封装与大语言模型的交互
-支持 OpenAI 兼容接口（OpenAI / DeepSeek / 通义千问 / 本地 Ollama 等）
-支持豆包 (Doubao / 火山方舟 Ark) Responses API（联网搜索）
-无 API Key 时自动降级为本地规则引擎（Demo 模式）
+· OpenAI 兼容接口（默认 DeepSeek deepseek-flash；也支持 OpenAI / 通义千问 / Kimi / 本地 Ollama 等）
+· 豆包 (Doubao / 火山方舟 Ark) Responses API（自带联网搜索，可选）
+· 没有 Key 或调用失败时返回空，由调用方改用本地能力（行程引擎 / 本地助手 / 规则识别）
 """
 
 import json
@@ -10,7 +10,6 @@ import logging
 import re
 import time
 import requests
-from urllib.parse import quote
 from openai import OpenAI
 from backend.config import Config
 
@@ -55,11 +54,16 @@ def _reset(name: str) -> None:
 
 
 def llm_status() -> dict:
-    """供 /api/health 展示当前 AI 能力是否可用"""
+    """供 /api/health、/api/config 展示当前 AI 能力是否可用"""
+    from backend.services import asr
+
+    llm_ok = Config.HAS_LLM and _available("llm")
     return {
-        "llm": Config.HAS_LLM and _available("llm"),
-        "web_search": Config.HAS_WEB_SEARCH and (_available("doubao") if Config.HAS_DOUBAO else _available("llm")),
-        "asr": Config.HAS_ASR,
+        "llm": llm_ok,
+        "web_search": Config.HAS_WEB_SEARCH and (llm_ok or (Config.HAS_DOUBAO and _available("doubao"))),
+        "vision": Config.HAS_VISION and llm_ok,
+        "asr": asr.status()["ready"],
+        "asr_engine": asr.status(),
     }
 
 
@@ -136,7 +140,7 @@ def _call_openai_responses(prompt: str, use_web_search: bool = False, model: str
         "stream": True,
     }
 
-    if use_web_search and Config.LLM_WEB_SEARCH == "live":
+    if use_web_search:
         payload["tools"] = [{"type": "web_search"}]
 
     try:
@@ -152,13 +156,6 @@ def _call_openai_responses(prompt: str, use_web_search: bool = False, model: str
     except Exception as e:
         _trip("llm", e)
         return ""
-
-
-def _call_openai_web_search(prompt: str) -> str:
-    """调用 OpenAI Responses API 做 live 联网搜索（仅 LLM_WIRE_API=responses 时可用）"""
-    if Config.LLM_WIRE_API != "responses" or Config.LLM_WEB_SEARCH != "live":
-        return ""
-    return _call_openai_responses(prompt, use_web_search=True, model=Config.LLM_WEB_SEARCH_MODEL)
 
 
 def _call_doubao_responses(prompt: str, use_web_search: bool = False) -> str:
@@ -203,51 +200,46 @@ def _call_doubao_responses(prompt: str, use_web_search: bool = False) -> str:
         return ""
 
 
-def _extract_json_array(text: str):
-    """
-    尽量健壮地从模型回复中解析出 JSON 数组。
-
-    豆包在联网搜索后经常会在 JSON 前后附带说明文字，或用 ```json ... ``` /
-    ``` ... ``` 代码块包裹结果，即使提示词中明确要求"只输出 JSON 数组"。
-    如果直接 json.loads 失败就直接判定为"无返回"并触发降级到静态默认列表，
-    会导致联网搜索结果被白白丢弃（这正是之前"豆包候选景点一直只有 8 个静态默认景点"的根因之一）。
-    这里做多级尝试：先整体解析，再剥离代码块围栏解析，最后在原文中正则提取
-    第一段形如 [...] 的片段解析，尽量从模型的真实回复里把数据捞出来。
-    """
+def parse_json(text: str):
+    """从模型回复里解析 JSON（对象或数组）：容忍代码块围栏、前后说明文字、被截断的数组"""
     if not text:
         return None
     text = text.strip()
-
-    # 1) 直接尝试整体解析
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            text = m.group(1).strip()
     try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            return data
+        return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # 2) 去除 ```json ... ``` 或 ``` ... ``` 代码块围栏后再解析
-    if "```" in text:
-        stripped = re.sub(r"```[a-zA-Z]*\s*", "", text)
-        stripped = stripped.replace("```", "").strip()
+    for opener, closer in (("{", "}"), ("[", "]")):
+        i, j = text.find(opener), text.rfind(closer)
+        if 0 <= i < j:
+            try:
+                return json.loads(text[i:j + 1])
+            except json.JSONDecodeError:
+                continue
+    # 输出被截断：保留最后一个完整对象，补齐括号
+    i = text.find("[")
+    k = text.rfind("}")
+    if 0 <= i < k:
+        head = text[:i]
+        body = text[i:k + 1] + "]"
+        closing = "}" * (head.count("{") - head.count("}"))
         try:
-            data = json.loads(stripped)
-            if isinstance(data, list):
-                return data
+            return json.loads(head + body + closing)
         except json.JSONDecodeError:
-            pass
-
-    # 3) 退而求其次：在文本中正则提取第一段完整的 JSON 数组片段
-    match = re.search(r"\[[\s\S]*\]", text)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
-
+            return None
     return None
+
+
+def _extract_json_array(text: str):
+    """解析模型返回的数组；也接受 {"places": [...]} 这类被包在对象里的数组（JSON 模式只能输出对象）"""
+    data = parse_json(text)
+    if isinstance(data, dict):
+        data = next((v for v in data.values() if isinstance(v, list)), None)
+    return data if isinstance(data, list) else None
 
 
 def _normalize_travel_style_fit(raw_fit: dict) -> dict:
@@ -335,7 +327,7 @@ def enrich_locations_travel_style_fit(locations: list, video_title: str = "") ->
         {"role": "system", "content": "你只输出合法 JSON 数组，不要解释、不要 Markdown。"},
         {"role": "user", "content": prompt},
     ]
-    result = chat_completion(messages, temperature=0.2, max_tokens=3000)
+    result = chat_completion(messages, temperature=0.2, max_tokens=3000, json_mode=True)
 
     if not result:
         result = _call_doubao_responses(prompt, use_web_search=False)
@@ -406,7 +398,7 @@ def filter_default_attractions(profile: dict, attractions: list) -> list:
     result = chat_completion([
         {"role": "system", "content": "你是专业旅行顾问。只输出合法 JSON 数组，不要解释、不要 Markdown。"},
         {"role": "user", "content": prompt},
-    ], temperature=0.3, max_tokens=3000)
+    ], temperature=0.3, max_tokens=3000, json_mode=True)
 
     if not result and Config.HAS_DOUBAO:
         logger.warning("filter_default_attractions: OpenAI 兼容 LLM 未返回内容，尝试豆包筛选")
@@ -438,125 +430,40 @@ def filter_default_attractions(profile: dict, attractions: list) -> list:
         return attractions
 
 
-def discover_trip_attractions(city: str, days: int, profile: dict) -> list:
-    """
-    用豆包 (Doubao / 火山方舟 Ark) Responses API 的联网搜索能力（web_search 工具），
-    搜索"{city}{days}日游攻略"相关内容（N 为用户填写的出行天数），归纳总结其中
-    被多篇攻略反复提及的景点 / 餐厅 / 街区，作为"地图预览"页的默认地点来源。
-
-    重要说明：豆包联网搜索拿到的是网页文本摘要，并非真实的抖音视频列表，因此这里
-    不会编造虚假的视频标题/封面/点赞数据，而是为每个归纳出的地点生成一个
-    真实可跳转的"抖音搜索结果"链接（douyin.com/search/...），点击后会跳转到
-    抖音站内对该地点相关内容的搜索结果页；并附带一句"内容提要"（video_hint）
-    用于在 UI 上模拟展示效果（明确标注为 AI 归纳，非真实视频数据）。
-
-    随后结合用户的旅行风格主画像测试结果（profile），调用 filter_default_attractions
-    让豆包基于画像描述文本对这些地点进行选中标记 + 生成推荐理由。
-
-    返回约 20 个地点，每个包含
-    name/type/lat/lng/keywords/video_hint/douyin_search_url/link_label/selected/reason
-    """
+def discover_trip_attractions(city: str, days: int, profile: dict) -> tuple[list, dict]:
+    """联网搜索「{城市}{天数}日游」攻略，归纳候选地点并按人格预选。详见 backend/services/web_search.py"""
     if not Config.HAS_WEB_SEARCH:
-        return []
+        return [], {"mode": "none", "sources": []}
+    from backend.services.web_search import discover_attractions
 
-    city = city or "上海"
-    days = days or 3
-    query_phrase = f"{city}{days}日游攻略"
-
-    discover_prompt = f"""你是一名熟悉社交媒体旅行内容生态的研究员。请联网搜索与"{query_phrase}"相关的攻略内容
-（可尝试搜索"{query_phrase}"、"{query_phrase} 抖音"、"{city} {days}天 旅行攻略 必去景点/美食"等关键词），
-并基于搜索到的真实内容，归纳总结其中**被多篇攻略反复提及**的景点、街区、餐厅或小吃店
-（尽量多挑选一些，争取找到约 18-22 个、需位于{city}市内、互不重复，可以包含景点也可以包含美食地点；
-如确实搜索不到这么多被多次提及的地点，可适当放宽"反复提及"的标准，但不要编造不存在的地点）。
-
-对每一个地点，请给出以下字段：
-- name: 地点名称（简洁、常见、可直接用于地图搜索）
-- type: 从 ["food","nature","culture","landmark","street"] 中选择最贴切的一个
-  （food=美食/餐厅小吃，nature=自然景观/公园绿地，culture=人文古迹/博物馆/展馆，landmark=地标建筑，street=商业街区/特色马路）
-- lat / lng: 该地点在{city}的大致 WGS84 经纬度坐标（数字，保留4位小数；不确定时给出所在区域中心的合理估计值）
-- keywords: 1-3 个简短关键词标签（数组）
-- video_hint: 用一句话客观描述"搜索到的攻略/笔记通常会怎样介绍这个地方"（20字以内，仅作内容提要展示）
-
-只输出一个 JSON 数组，不要输出任何其他文字、解释或代码块标记，格式如下：
-[{{"name": "外滩", "type": "landmark", "lat": 31.2400, "lng": 121.4900, "keywords": ["夜景", "万国建筑"], "video_hint": "常作为{city}{days}日游开篇打卡点被提及"}}]"""
-
-    result = _call_openai_web_search(discover_prompt)
-    if result:
-        logger.info("discover_trip_attractions: OpenAI 兼容联网搜索返回内容")
-    elif Config.HAS_DOUBAO:
-        logger.warning("discover_trip_attractions: OpenAI 兼容联网搜索未返回内容，尝试豆包联网搜索")
-        result = _call_doubao_responses(discover_prompt, use_web_search=True)
-
-    if not result:
-        logger.warning("discover_trip_attractions: 联网搜索未返回内容（调用失败/超时/无 API Key），将降级到静态默认景点列表")
-        return []
-
-    discovered = _extract_json_array(result)
-    if discovered is None:
-        # 直接 json.loads 容易因为模型在 JSON 前后附带说明文字或代码块围栏而失败，
-        # 进而被错误地当成"无返回"触发降级 —— 这正是之前"候选精选景点一直只有 8 个（静态默认列表数量）"的根因。
-        # _extract_json_array 已尝试多种容错解析方式，仍失败时才在此记录原始内容用于排查。
-        logger.warning(f"discover_trip_attractions: 无法从豆包返回内容中解析出 JSON 数组，原始返回前 500 字: {result[:500]!r}")
-        return []
-
-    try:
-        # 整理地点数据：去重、生成唯一 ID、补全默认提要，并为每个地点生成
-        # 真实可跳转的抖音搜索结果链接（搜索该地点相关内容，而非具体某条视频）
-        attractions = []
-        seen_names = set()
-        for i, attr in enumerate(discovered):
-            if not isinstance(attr, dict):
-                continue
-            name = (attr.get("name") or "").strip()
-            if not name or name in seen_names:
-                continue
-            seen_names.add(name)
-
-            attr["name"] = name
-            attr["id"] = f"loc_{len(attractions)+1:03d}"
-            attr["selected"] = True  # 默认全选，后续由 filter_default_attractions 按用户画像筛选
-
-            search_query = f"{name} {city} {days}日游"
-            attr["douyin_search_url"] = f"https://www.douyin.com/search/{quote(search_query)}"
-            attr["link_label"] = f"在抖音搜索「{name}」相关内容"
-            attr["source_label"] = "AI 联网搜索归纳的内容提要 · 非真实视频数据"
-            if not (attr.get("video_hint") or "").strip():
-                attr["video_hint"] = f"多篇「{query_phrase}」笔记提到了「{name}」"
-
-            attractions.append(attr)
-
-        logger.info(f"discover_trip_attractions: 豆包联网搜索归纳出 {len(attractions)} 个去重后的地点（{city}{days}日游）")
-
-        if not attractions:
-            return []
-
-        # 结合用户旅行风格主画像测试结果，把画像描述文本发给豆包，
-        # 让它基于画像去挑选最符合该用户偏好的地点并生成推荐理由
-        if profile:
-            attractions = filter_default_attractions(profile, attractions)
-
-        return attractions
-    except (TypeError, AttributeError) as e:
-        logger.warning(f"Failed to process discover_trip_attractions response: {e}")
-        return []
+    return discover_attractions(city or "上海", days or 3, profile or {})
 
 
-def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 2000) -> str:
+def _request_options(json_mode: bool, thinking: bool | None, max_tokens: int) -> dict:
+    """不同服务商的扩展参数：DeepSeek 的思考开关、JSON 模式（只对确定支持的服务商开启）"""
+    opts: dict = {"max_tokens": max_tokens}
+    if Config.LLM_PROVIDER == "deepseek":
+        think = (Config.LLM_THINKING == "on") if thinking is None else thinking
+        opts["extra_body"] = {"thinking": {"type": "enabled" if think else "disabled"}}
+        if think:
+            # 思考过程也计入 max_tokens，不放宽的话答案会被截成空串
+            opts["max_tokens"] = max_tokens + 8000
+    if json_mode and Config.LLM_PROVIDER in ("deepseek", "openai"):
+        opts["response_format"] = {"type": "json_object"}
+    return opts
+
+
+def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 2000, json_mode: bool = False, thinking: bool | None = None) -> str:
     """
-    调用 LLM 进行对话补全
+    调用 LLM 进行对话补全。失败（含熔断冷却期内）返回空串，调用方应改用本地能力。
+    json_mode=True 时提示词里必须出现「JSON」字样（OpenAI / DeepSeek 的要求）。
     """
     if not Config.HAS_LLM or not _available("llm"):
         return ""
 
-    prompt_parts = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = message.get("content", "")
-        if content:
-            prompt_parts.append(f"{role}: {content}")
-    prompt = "\n\n".join(prompt_parts)
-
-    if Config.LLM_WIRE_API == "responses":
+    multimodal = any(isinstance(m.get("content"), list) for m in messages)
+    if Config.LLM_WIRE_API == "responses" and not multimodal:
+        prompt = "\n\n".join(f"{m.get('role', 'user')}: {m['content']}" for m in messages if m.get("content"))
         text = _call_openai_responses(prompt, use_web_search=False, model=Config.LLM_MODEL)
         if text or not _available("llm"):
             return text
@@ -569,14 +476,52 @@ def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 
             model=Config.LLM_MODEL,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            **_request_options(json_mode, thinking, max_tokens),
         )
-        content = response.choices[0].message.content
-        if content is None:
-            logger.warning("LLM 返回空内容")
+        choice = response.choices[0]
+        content = choice.message.content
+        if not content:
+            logger.warning("LLM 返回空内容（finish_reason=%s）", choice.finish_reason)
             return ""
         _reset("llm")
         return content.strip()
+    except Exception as e:
+        _trip("llm", e)
+        return ""
+
+
+def chat_with_tools(messages: list, tools: list, handlers: dict, max_rounds: int = 3, temperature: float = 0.6, max_tokens: int = 1500) -> str:
+    """
+    带工具调用的对话（Chat Completions 的 function calling）。
+    handlers: 工具名 → 函数(**arguments) -> str。模型不再调用工具时返回最终回答；失败返回空串。
+    """
+    if not Config.HAS_LLM or not _available("llm") or not client or Config.LLM_WIRE_API == "responses":
+        return ""
+    msgs = list(messages)
+    try:
+        for round_no in range(max_rounds + 1):
+            kwargs = _request_options(False, False, max_tokens)
+            if round_no < max_rounds:
+                kwargs.update(tools=tools, tool_choice="auto")
+            response = client.chat.completions.create(model=Config.LLM_MODEL, messages=msgs, temperature=temperature, **kwargs)
+            msg = response.choices[0].message
+            calls = getattr(msg, "tool_calls", None) or []
+            if not calls:
+                _reset("llm")
+                return (msg.content or "").strip()
+            msgs.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [{"id": c.id, "type": "function", "function": {"name": c.function.name, "arguments": c.function.arguments}} for c in calls],
+            })
+            for c in calls:
+                try:
+                    args = json.loads(c.function.arguments or "{}")
+                    result = handlers[c.function.name](**args)
+                except Exception as e:  # noqa: BLE001 — 工具失败也要告诉模型，让它换个说法回答
+                    result = f"工具调用失败：{str(e)[:100]}"
+                msgs.append({"role": "tool", "tool_call_id": c.id, "content": result or "（没有结果）"})
+        return ""
     except Exception as e:
         _trip("llm", e)
         return ""
@@ -643,22 +588,13 @@ def generate_itinerary(locations: list, user_profile: dict, trip_config: dict, c
                 {"role": "user", "content": prompt},
             ],
             temperature=0.5,
-            max_tokens=3000,
+            max_tokens=6000,
+            json_mode=True,
         )
-        raw = None
-        if result:
-            text = result
-            if "```" in text:
-                text = text.split("```json")[-1] if "```json" in text else text.split("```")[1]
-                text = text.split("```")[0]
-            try:
-                raw = json.loads(text.strip())
-            except json.JSONDecodeError:
-                start_i, end_i = text.find("{"), text.rfind("}")
-                try:
-                    raw = json.loads(text[start_i:end_i + 1]) if start_i >= 0 else None
-                except json.JSONDecodeError:
-                    logger.warning("大模型返回的行程不是合法 JSON，改用行程引擎")
+        raw = parse_json(result) if result else None
+        if result and not isinstance(raw, dict):
+            logger.warning("大模型返回的行程不是合法 JSON，改用行程引擎")
+            raw = None
         fixed = finalize_llm_itinerary(raw, locations, profile, trip_config, catalog) if raw else None
         if fixed:
             fixed["_engine"] = "llm"
@@ -669,43 +605,118 @@ def generate_itinerary(locations: list, user_profile: dict, trip_config: dict, c
     return plan
 
 
-def chat_with_companion(message: str, context: dict) -> str:
+_WMO = (((0,), "晴"), ((1, 2, 3), "多云"), ((45, 48), "雾"), (tuple(range(51, 68)), "雨"), (tuple(range(71, 78)), "雪"), ((80, 81, 82), "阵雨"), ((85, 86), "阵雪"), ((95, 96, 99), "雷雨"))
+
+
+def _compact_trip(context: dict) -> str:
+    """把前端传来的行程压缩成几行文字（整份 JSON 动辄几万字，既慢又分散模型注意力）"""
+    lines = []
+    trip = context.get("trip") or {}
+    if trip:
+        lines.append(f"目的地：{trip.get('city') or '未知'}；出发：{trip.get('startDate') or trip.get('start_date') or '未定'}；{trip.get('days') or '?'} 天；预算：{trip.get('budget') or '未说明'}")
+    itinerary = context.get("itinerary") or {}
+    for d in (itinerary.get("days") or [])[:14]:
+        stops = []
+        for it in d.get("items") or []:
+            loc = it.get("location") or {}
+            name = loc.get("name") or it.get("activity") or ""
+            if name:
+                stops.append(f"{it.get('time') or ''} {name}".strip())
+        if stops:
+            lines.append(f"Day {d.get('day')}：" + " → ".join(stops))
+    weather = context.get("weather")
+    for w in ((weather.get("days") if isinstance(weather, dict) else weather) or [])[:7]:
+        if isinstance(w, dict) and w.get("date") and w.get("code") is not None:
+            sky = next((t for codes, t in _WMO if w["code"] in codes), "多云")
+            lines.append(f"{w['date']} {sky}，{w.get('tmin')}~{w.get('tmax')}°C，降水概率 {w.get('rain_prob', '?')}%")
+    return "\n".join(lines) or "（还没有行程）"
+
+
+_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "联网搜索实时信息：营业时间、门票价格、预约方式、闭馆通知、展览演出、交通线路、最新开业或关停等。知识可能过时的问题都应该先搜索。",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "搜索词，包含城市名和地点名，如「成都 大熊猫基地 预约 门票」"}},
+            "required": ["query"],
+        },
+    },
+}
+
+
+def chat_with_companion(message: str, context: dict, local_hint: str = "") -> tuple[str, list]:
     """
-    旅行搭子对话（支持多轮）
+    旅行搭子对话（支持多轮）。返回 (回答, 引用的资料)。
+    开启联网搜索时模型可以自己决定是否搜索；local_hint 是本地助手基于行程算出来的参考答案（距离、时间、预算等）。
     """
-    # 构建上下文
-    itinerary = context.get("itinerary", {})
-    profile = context.get("profile", {})
-    current_location = context.get("current_location", "")
-    chat_history = context.get("chat_history", [])
+    from datetime import date
 
-    system_prompt = f"""你是"旅搭子"，一个温暖、有趣、实用的 AI 旅行伙伴。
+    profile = context.get("profile") or {}
+    city = ((context.get("trip") or {}).get("city") or "").strip()
+    persona = profile.get("personality_name") or profile.get("mbti") or "未测试"
+    system_prompt = f"""你是「旅搭子」，一个熟悉当地、温暖实用的旅行伙伴。今天是 {date.today().isoformat()}。
 
-当前旅行信息：
-- 路线：{json.dumps(itinerary, ensure_ascii=False) if itinerary else '暂无'}
-- 用户偏好：{json.dumps(profile, ensure_ascii=False) if profile else '暂无'}
-- 当前位置：{current_location or '未知'}
+## 用户的旅行
+{_compact_trip(context)}
+旅行人格：{persona}
+{f"## 参考（根据行程计算的事实，可直接引用）{chr(10)}{local_hint}" if local_hint else ""}
 
-你的角色：
-1. 像一个本地朋友一样给出建议
-2. 回答简洁实用，不超过200字
-3. 如果用户问路线调整，给出具体方案
-4. 语气亲切自然，可以用 emoji
-5. 如果不确定，坦诚告知
-6. 记住之前的对话内容，保持连贯"""
+## 回答方式
+1. 像本地朋友一样直接给建议，200 字以内，可以用列表
+2. 问路线调整时给出具体方案（第几天、挪到哪、为什么）
+3. 营业时间、门票、预约、活动这类会变的信息{"先用 web_search 查，回答里用 [1] [2] 标注出处" if Config.HAS_WEB_SEARCH else "提醒用户出发前再确认"}
+4. 不确定就直说，不要编造；行程里没写的信息（比如出发日期没定）不要自己假设"""
 
     messages = [{"role": "system", "content": system_prompt}]
-
-    # 加入历史对话（最多10轮）
-    if chat_history:
-        for turn in chat_history[-10:]:
-            role = turn.get("role", "user")
-            content = turn.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-
-    # 加入当前消息
+    for turn in (context.get("chat_history") or [])[-10:]:
+        role, content = turn.get("role"), turn.get("content")
+        if role in ("user", "assistant") and content and content != message:
+            messages.append({"role": role, "content": str(content)[:2000]})
     messages.append({"role": "user", "content": message})
 
-    # 大模型不可用时返回空串，由路由层改用本地助手（基于行程与景点库计算的回答）
-    return chat_completion(messages, temperature=0.8)
+    if not Config.HAS_WEB_SEARCH or Config.LLM_WIRE_API == "responses":
+        return chat_completion(messages, temperature=0.7, max_tokens=1200), []
+
+    from backend.services.web_search import answer_sources
+
+    sources: list[dict] = []
+
+    def web_search(query: str) -> str:
+        text, items = answer_sources(str(query)[:80], city)
+        start = len(sources) + 1
+        sources.extend(items)
+        if not items:
+            return "没有搜到相关结果"
+        # 编号接着之前的往下排，模型引用 [n] 时与返回给前端的列表一一对应
+        return re.sub(r"^\[(\d+)\]", lambda m: f"[{int(m.group(1)) + start - 1}]", text, flags=re.M)
+
+    text = chat_with_tools(messages, [_SEARCH_TOOL], {"web_search": web_search}, max_rounds=2, temperature=0.6, max_tokens=1200)
+    if not text:
+        return chat_completion(messages, temperature=0.7, max_tokens=1200), []
+    cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(sources)})
+    return text, [{**sources[n - 1], "n": n} for n in cited]
+
+
+def polish_transcript(text: str, city: str = "", hints: list[str] | None = None) -> str:
+    """
+    语音转写常把地名听成同音字（「五康路」「外摊」），也可能夹杂繁体。
+    让大模型结合城市与候选地名改正错字、统一为简体，不增删内容；失败时原样返回。
+    """
+    if not text or not Config.HAS_LLM:
+        return text
+    prompt = f"""下面是一段{city}旅行视频的语音识别结果，可能有同音错字（尤其是地名、店名）和繁体字。
+请改正错字、统一为简体中文、补全标点。不要增加或删除内容，不要总结。
+{f"可能出现的地名：{'、'.join(hints[:60])}" if hints else ""}
+
+识别结果：
+{text[:6000]}
+
+只输出 JSON：{{"text": "改正后的全文"}}"""
+    out = parse_json(chat_completion([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=4000, json_mode=True))
+    fixed = (out or {}).get("text") if isinstance(out, dict) else None
+    # 防止模型擅自总结：改正后的长度应与原文相近
+    if isinstance(fixed, str) and 0.6 * len(text[:6000]) <= len(fixed) <= 1.5 * len(text[:6000]) + 50:
+        return fixed.strip() + text[6000:]
+    return text

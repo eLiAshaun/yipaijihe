@@ -50,6 +50,11 @@ def create_app():
     init_db()
     register_blueprints(app)
 
+    # 本地语音模型在后台下载 / 加载，不阻塞启动
+    from backend.services import asr
+
+    asr.warm_up()
+
     # ---------- 前端（SPA，hash 路由） ----------
     @app.get("/")
     def index():
@@ -88,8 +93,11 @@ def create_app():
                 "securityJsCode": Config.AMAP_SECURITY_CODE,
             },
             "llm": caps["llm"],
+            "model": Config.LLM_MODEL if Config.HAS_LLM else "",
             "web_search": caps["web_search"],
+            "vision": caps["vision"],
             "asr": caps["asr"],
+            "asr_status": caps["asr_engine"],
             # 有内置景点库的城市；开启联网搜索后可以规划任意城市
             "cities": list_cities(),
         }
@@ -136,11 +144,15 @@ def main():
     if port != Config.PORT:
         logger.info("端口 %s 已被占用，改用 %s", Config.PORT, port)
     logger.info("🚀 一拍迹合已启动：%s", url)
+    from backend.services import asr
+
+    asr_engine = asr.engine()
     logger.info(
-        "🧠 AI：%s ｜ 联网搜索：%s ｜ 语音转写：%s",
-        f"已配置（{Config.LLM_MODEL}）" if Config.HAS_LLM else "未配置，使用本地规则引擎",
+        "🧠 大模型：%s ｜ 联网搜索：%s ｜ 看画面：%s ｜ 语音转写：%s",
+        f"{Config.LLM_MODEL}" if Config.HAS_LLM else "未配置（使用本地行程引擎与助手）",
         "开启" if Config.HAS_WEB_SEARCH else "未开启",
-        "开启" if Config.HAS_ASR else "未开启（用视频标题 / 文案提取地点）",
+        "开启" if Config.HAS_VISION else "未开启",
+        {"mimo": "MiMo 云端", "local": f"本地 Whisper（{Config.ASR_MODEL}，首次使用会在后台下载模型）", "none": "未开启（读取视频标题 / 画面 / 文案识别地点）"}[asr_engine],
     )
     if os.getenv("OPEN_BROWSER") == "1" and not os.getenv("WERKZEUG_RUN_MAIN"):
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()

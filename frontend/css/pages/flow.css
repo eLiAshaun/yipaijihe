@@ -159,3 +159,21 @@
 .chip--muted { opacity: 0.6; text-decoration: line-through; }
 .cap-note { margin-top: -2px; }
 .found .quote { font-size: var(--fs-sm); font-style: normal; border-left: 3px solid var(--line); padding-left: 10px; }
+
+/* 每条视频的实时进度 */
+.video-rows { display: grid; gap: 8px; }
+.video-rows li { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 10px; color: var(--ink-3); font-size: var(--fs-sm); }
+.video-rows code { font-family: var(--font-mono); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-rows li.on { color: var(--ink); }
+.video-rows li.on .stage-dot { background: var(--seal); border-color: var(--seal); animation: pulse 1s ease-in-out infinite; }
+.video-rows li.done { color: var(--moss); }
+.video-rows li.done .stage-dot { background: var(--moss); border-color: var(--moss); }
+.video-stage { font-weight: 700; }
+.analysis-label svg { display: inline-block; width: 15px; height: 15px; vertical-align: -2px; }
+
+/* 每条视频听到 / 看到了什么 */
+.video-done { display: grid; gap: 8px; margin-bottom: var(--s-4); }
+.video-heard { padding: 10px 14px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-md); font-size: var(--fs-sm); }
+.video-heard summary { display: flex; align-items: center; gap: 8px; cursor: pointer; flex-wrap: wrap; }
+.video-heard summary svg { width: 16px; height: 16px; color: var(--seal); flex: none; }
+.video-heard p { margin-top: 8px; color: var(--ink-2); line-height: 1.7; }

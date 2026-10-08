@@ -10,8 +10,11 @@ sys.path.insert(0, ROOT)
 # 在导入 backend 之前把数据库指向临时文件，避免污染 instance/
 _TMP = tempfile.mkdtemp(prefix="ypjh_test_")
 os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
-os.environ["LLM_API_KEY"] = ""
-os.environ["DOUBAO_API_KEY"] = ""
+# 测试全部离线运行：不用任何真实 Key、不下载语音模型、不联网搜索
+for _k in ("LLM_API_KEY", "DEEPSEEK_API_KEY", "DOUBAO_API_KEY", "MIMO_API_KEY"):
+    os.environ[_k] = ""
+os.environ["ASR_ENGINE"] = "off"
+os.environ["WEB_SEARCH"] = "off"
 
 
 @pytest.fixture(scope="session")

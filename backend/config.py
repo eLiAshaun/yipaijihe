@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from dotenv import load_dotenv
 
@@ -28,6 +29,12 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _is_vision_model(model: str) -> bool:
+    """按模型名判断是否能看图（DeepSeek V4.1-Flash、GPT-4o 系列、通义 / 智谱的视觉模型等）"""
+    m = model.lower()
+    return any(k in m for k in ("deepseek-flash", "gpt-4o", "gpt-4.1", "gpt-5", "-vl", "vision", "glm-4v"))
+
+
 class Config:
     """应用配置"""
 
@@ -38,19 +45,33 @@ class Config:
     # 默认只监听本机；局域网 / 容器部署时显式设为 0.0.0.0
     HOST = os.getenv("FLASK_HOST", "127.0.0.1")
 
-    # LLM
-    LLM_API_KEY = _secret("LLM_API_KEY")
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    LLM_WEB_SEARCH_MODEL = os.getenv("LLM_WEB_SEARCH_MODEL", "gpt-4o-mini-search-preview")
-    LLM_WEB_SEARCH_CONTEXT_SIZE = os.getenv("LLM_WEB_SEARCH_CONTEXT_SIZE", "medium")
-    # chat = Chat Completions（OpenAI / DeepSeek / 通义 / Kimi / Ollama 都支持）；responses 仅 OpenAI 官方等少数服务支持
+    # LLM（OpenAI 兼容接口）。默认 DeepSeek：deepseek-flash（V4.1-Flash，支持看图、1M 上下文）
+    # 也可以换成 OpenAI / 通义 / Kimi / 本地 Ollama：改 LLM_BASE_URL 与 LLM_MODEL 即可
+    LLM_API_KEY = _secret("LLM_API_KEY") or _secret("DEEPSEEK_API_KEY")
+    LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "https://api.deepseek.com").strip().rstrip("/")
+    LLM_MODEL = (os.getenv("LLM_MODEL") or "deepseek-flash").strip()
+    LLM_PROVIDER = "deepseek" if "deepseek.com" in LLM_BASE_URL else "openai" if "api.openai.com" in LLM_BASE_URL else "other"
+    # 思考模式：off（默认）—— 抽取、归纳、排行程这类任务关掉思考快 4-5 倍，质量足够；on 更细致但慢
+    LLM_THINKING = os.getenv("LLM_THINKING", "off").strip().lower()
+    # 看图（读视频画面里的字幕 / 招牌）：auto = 按模型名判断是否多模态；1 / 0 强制开关
+    LLM_VISION = os.getenv("LLM_VISION", "auto").strip().lower()
+    # chat = Chat Completions（推荐）；responses = OpenAI Responses API（可用 OpenAI 自带的 web_search 工具）
     LLM_WIRE_API = os.getenv("LLM_WIRE_API", "chat").strip().lower()
-    LLM_WEB_SEARCH = os.getenv("LLM_WEB_SEARCH", "live")
-    LLM_TIMEOUT = _float_env("LLM_TIMEOUT", 45)
+    LLM_WEB_SEARCH_MODEL = os.getenv("LLM_WEB_SEARCH_MODEL", "gpt-4o-mini-search-preview")
+    LLM_TIMEOUT = _float_env("LLM_TIMEOUT", 60)
     LLM_MAX_RETRIES = _int_env("LLM_MAX_RETRIES", 1)
 
-    # MiMo ASR (抖音视频语音转文字)
+    # 语音转写（听抖音视频里的讲解）
+    #   auto  = 配了 MIMO_API_KEY 用 MiMo 云端转写，否则用本地 Whisper（免费，需安装 requirements-video.txt）
+    #   local / mimo / off
+    ASR_ENGINE = os.getenv("ASR_ENGINE", "auto").strip().lower()
+    # 本地 Whisper 模型：tiny / base / small（默认，约 460MB，中文地名识别明显好于 base）/ medium / large-v3
+    ASR_MODEL = os.getenv("ASR_MODEL", "small").strip()
+    ASR_MODEL_DIR = os.getenv("ASR_MODEL_DIR", "").strip()
+    # 单条视频最多转写多少秒（旅行视频的地点基本都在前几分钟）
+    ASR_MAX_SECONDS = _int_env("ASR_MAX_SECONDS", 600)
+
+    # MiMo ASR（可选的云端语音转写）
     MIMO_API_KEY = _secret("MIMO_API_KEY")
     MIMO_API_BASE = os.getenv("MIMO_API_BASE", "https://token-plan-cn.xiaomimimo.com/v1")
     MIMO_MODEL = os.getenv("MIMO_MODEL", "mimo-v2.5-asr")
@@ -84,6 +105,10 @@ class Config:
 
     # 判断是否配置了 LLM
     HAS_LLM = bool(LLM_API_KEY)
-    # 联网搜索：豆包，或 OpenAI 官方 Responses API 的 web_search 工具
-    HAS_WEB_SEARCH = HAS_DOUBAO or (HAS_LLM and LLM_WIRE_API == "responses" and LLM_WEB_SEARCH == "live")
-    HAS_ASR = bool(MIMO_API_KEY)
+    HAS_VISION = HAS_LLM and (LLM_VISION in ("1", "true", "on") or (LLM_VISION == "auto" and _is_vision_model(LLM_MODEL)))
+    # 联网搜索：auto = 有大模型就开启（搜索引擎找资料 + 大模型归纳；配置了豆包时优先用豆包内置搜索）；off = 关闭
+    WEB_SEARCH = os.getenv("WEB_SEARCH", "auto").strip().lower()
+    HAS_WEB_SEARCH = WEB_SEARCH != "off" and (HAS_DOUBAO or HAS_LLM)
+    HAS_MIMO_ASR = bool(MIMO_API_KEY) and ASR_ENGINE in ("auto", "mimo")
+    HAS_LOCAL_ASR = ASR_ENGINE in ("auto", "local") and importlib.util.find_spec("faster_whisper") is not None
+    HAS_ASR = HAS_MIMO_ASR or HAS_LOCAL_ASR

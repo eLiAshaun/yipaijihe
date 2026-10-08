@@ -133,6 +133,7 @@ export default {
       state.places = [];
       state.selectedIds = new Set();
       state.videoAnalysis = null;
+      state.discovery = null;
       renderCities();
       refresh();
     };
@@ -145,8 +146,9 @@ export default {
         return h("button", { class: "chip", type: "button", "aria-pressed": String(name === t.city), onclick: () => setCity(name) }, icon("pin"), name, c ? h("small", { class: "faint" }, ` ${c.places} 个地点`) : null);
       });
       const other = cfg.web_search
-        ? h("form", { class: "city-other", onsubmit: (e) => (e.preventDefault(), setCity(e.target.city.value)) }, h("input", { class: "input", name: "city", placeholder: "其他城市，如 杭州", "aria-label": "其他城市" }), h("button", { class: "btn btn--quiet btn--sm", type: "submit" }, "去这里"))
-        : h("p", { class: "hint" }, "目前内置了上海的景点库。想规划其他城市，在 .env 里配置 DOUBAO_API_KEY 开启联网搜索。");
+        ? [h("form", { class: "city-other", onsubmit: (e) => (e.preventDefault(), setCity(e.target.city.value)) }, h("input", { class: "input", name: "city", placeholder: "其他城市，如 杭州", "aria-label": "其他城市" }), h("button", { class: "btn btn--quiet btn--sm", type: "submit" }, "去这里")),
+           h("p", { class: "hint" }, "已开启联网搜索：任何城市都会搜索最新攻略来推荐地点。")]
+        : h("p", { class: "hint" }, "目前内置了上海的景点库。想规划其他城市，在 .env 里填上 DEEPSEEK_API_KEY 开启联网搜索。");
       mountInto(cityBox, h("div", { class: "chip-row" }, chips), other);
     }
     getConfig().then((c) => ((cfg = c), ctx.alive() && renderCities())).catch(() => {});

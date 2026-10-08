@@ -1,5 +1,8 @@
 """
-旅行搭子对话路由：有大模型时用大模型，否则用本地助手（基于行程、景点库、天气计算回答）
+旅行搭子对话路由：
+  · 本地助手先基于行程、景点库、天气算出事实（距离、时间、预算…）
+  · 有大模型时把这些事实交给它组织回答；开启联网搜索时它还可以自己查营业时间、门票等实时信息
+  · 大模型不可用时直接返回本地助手的回答
 """
 
 from flask import Blueprint, jsonify, request
@@ -34,5 +37,12 @@ def send_message():
     city = ((context.get("trip") or {}).get("city") or "上海")[:20]
 
     local_text, suggestions = assistant.reply(message, context, _catalog(city))
-    text = chat_with_companion(message, context)
-    return jsonify({"reply": text or local_text, "suggestions": suggestions, "engine": "llm" if text else "local"})
+    # 只有问到具体问题（吃什么、怎么走、预算…）时，本地算出的结果才是有用的事实；概览类的客套话不传给大模型
+    hint = local_text if assistant.intent_of(message) != "summary" else ""
+    text, sources = chat_with_companion(message, context, local_hint=hint)
+    return jsonify({
+        "reply": text or local_text,
+        "suggestions": suggestions,
+        "sources": sources if text else [],
+        "engine": "llm" if text else "local",
+    })

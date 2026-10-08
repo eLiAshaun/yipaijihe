@@ -1,0 +1,6 @@
+# 视频分析的可选组件（run.sh / run.bat 会自动尝试安装，装不上不影响其他功能）
+#   · faster-whisper：本地语音转写，免费、不需要任何 Key（自带 PyAV 解码，不需要系统装 ffmpeg）
+#   · Pillow：截取视频画面交给大模型看字幕和招牌
+# 首次使用会在后台自动下载语音模型（默认 small，约 460MB；huggingface.co 连不上时自动走 hf-mirror.com）
+faster-whisper>=1.1
+Pillow>=10.0

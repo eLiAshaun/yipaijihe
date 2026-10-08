@@ -12,9 +12,11 @@ services:
     envVars:
       - key: DB_PATH
         value: /data/luvdazi.db
+      - key: ASR_MODEL_DIR
+        value: /data/models
+      - key: DEEPSEEK_API_KEY
+        sync: false          # 以下 Key 在 Render 控制台填写，不进仓库；全部留空也能运行（本地行程引擎 + 内置景点库）
       - key: LLM_API_KEY
-        sync: false          # 以下 Key 在 Render 控制台填写，不进仓库；全部留空也能以 Demo 模式运行
-      - key: LLM_BASE_URL
         sync: false
       - key: MIMO_API_KEY
         sync: false

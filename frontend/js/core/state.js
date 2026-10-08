@@ -58,6 +58,7 @@ export const state = {
   videoLinks: [],
   videoAnalysis: null,
   places: [], // 地点池（视频提取 / 联网搜索 / 本地库）
+  discovery: null, // 联网搜索的元信息：{ mode, sources, city }
   selectedIds: new Set(),
   placesSource: "",
 
@@ -94,6 +95,7 @@ export function resetTrip() {
   state.videoLinks = [];
   state.videoAnalysis = null;
   state.places = [];
+  state.discovery = null;
   state.selectedIds = new Set();
   state.placesSource = "";
   state.itinerary = null;
@@ -114,7 +116,7 @@ export function resetAll() {
 
 // ------------------------------------------------------------------ 草稿 ----
 /** 浏览器刷新 / 误关页面不丢进度：行程与选项自动落到 localStorage */
-const DRAFT_KEYS = ["trip", "hasBuddy", "buddy", "places", "placesSource", "itinerary", "tripId", "feedbacks", "transport"];
+const DRAFT_KEYS = ["trip", "hasBuddy", "buddy", "places", "placesSource", "discovery", "itinerary", "tripId", "feedbacks", "transport"];
 
 export const persistDraft = debounce(() => {
   if (!state.user) return;

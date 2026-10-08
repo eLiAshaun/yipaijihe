@@ -31,6 +31,16 @@
 .place-meta svg { width: 13px; height: 13px; }
 .place-link { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--seal-strong); text-underline-offset: 3px; }
 .place-link svg { width: 12px; }
+.place-src { margin-left: 0; color: var(--ink-3); max-width: 100%; }
+.place-src + .place-link:not(.place-src) { margin-left: auto; }
+.place-tip { display: flex; gap: 6px; align-items: flex-start; font-size: var(--fs-xs); color: color-mix(in srgb, var(--sun) 45%, var(--ink)); }
+.place-tip svg { width: 13px; height: 13px; flex: none; margin-top: 2px; }
+
+.sources-banner { display: block; }
+.sources-banner summary { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.sources-banner summary::-webkit-details-marker { display: none; }
+.source-list { margin: 10px 0 2px 28px; display: grid; gap: 4px; list-style: decimal; color: var(--ink-2); }
+.source-list a { color: var(--ink); text-underline-offset: 3px; }
 
 .add-place { position: relative; display: grid; gap: 8px; padding: var(--s-4); border: 2px dashed var(--line); border-radius: var(--r-md); }
 .add-place .field-label { display: flex; align-items: center; gap: 6px; }

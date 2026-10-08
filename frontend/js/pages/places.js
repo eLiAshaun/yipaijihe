@@ -7,6 +7,7 @@ import { createMapView, searchPlaces } from "../services/map.js";
 import { hasCoords, PACES } from "../services/planner.js";
 import { isPersonalityMatch, styleProfile } from "../services/persona-fit.js";
 import { generateItinerary } from "../services/itinerary.js";
+import { getConfig } from "../services/config.js";
 import { toast, toastError } from "../ui/toast.js";
 
 const VALID_TYPES = Object.keys(TYPE_LABEL);
@@ -59,14 +60,27 @@ export default {
     async function fetchRecommended() {
       const data = await api.post("/api/locations/default-recommend", { profile: styleProfile(), city: state.trip.city, days: state.trip.days }, { signal: ctx.signal });
       const src = data.source === "web_search" ? "ai_discover" : "builtin";
-      if (data.message) notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("info"), data.message));
+      state.discovery = data.source === "web_search" ? { mode: data.mode, sources: data.sources || [], city: state.trip.city } : null;
+      notice.replaceChildren(...[data.message && h("div", { class: "banner banner--info" }, icon("info"), data.message), sourcesBanner()].filter(Boolean));
       return (data.attractions || []).map((l, i) => normalize(l, i, src));
     }
 
+    /** 联网搜索参考了哪些攻略：可展开查看原文链接 */
+    function sourcesBanner() {
+      const d = state.discovery;
+      if (!d || d.mode !== "web" || !d.sources?.length) return null;
+      return h("details", { class: "banner banner--info sources-banner" },
+        h("summary", null, icon("search"), `联网搜索了「${d.city}」的攻略，下面的地点归纳自 ${d.sources.length} 篇文章，点开看出处`),
+        h("ol", { class: "source-list" }, d.sources.map((s) => h("li", null, h("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.title), h("span", { class: "faint" }, ` · ${s.engine}`)))));
+    }
+
     async function load() {
-      if (places().length) return;
+      if (places().length) return notice.replaceChildren(...[sourcesBanner()].filter(Boolean));
       mountInto(list, Array.from({ length: 5 }, () => h("div", { class: "skeleton", style: { height: "104px" } })));
-      notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("sparkles"), `正在准备「${state.trip.city}」的候选地点，并按你的旅行人格预选…`));
+      const web = await getConfig().then((c) => c.web_search).catch(() => false);
+      notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("sparkles"), web
+        ? `正在联网搜索「${state.trip.city}」的最新攻略，由大模型归纳地点并按你的旅行人格预选，大约需要 20–30 秒…`
+        : `正在准备「${state.trip.city}」的候选地点，并按你的旅行人格预选…`));
       let got = [];
       try {
         got = await fetchRecommended();
@@ -74,27 +88,35 @@ export default {
         if (e.name === "AbortError") return;
         toastError(e);
       }
-      if (notice.textContent.startsWith("正在准备")) notice.replaceChildren();
+      if (/^正在(准备|联网)/.test(notice.textContent)) notice.replaceChildren();
       state.places = got;
       const pre = (p) => (typeof p.selected === "boolean" ? p.selected : isPersonalityMatch(p));
       state.selectedIds = new Set(got.filter((p) => hasCoords(p) && pre(p)).map((p) => p.id));
       persistDraft();
     }
 
-    /** 灵感素材里的地点之外，再从景点库补充一些（默认不勾选） */
-    async function addRecommended(btn) {
-      btn.classList.add("is-loading");
+    /** 灵感素材里的地点之外，再补充一些（联网搜索或景点库；默认不勾选）。联网要 20–30 秒，期间列表可能重绘，所以用状态而不是按钮的 class 记录「进行中」 */
+    let supplementing = false;
+    async function addRecommended() {
+      if (supplementing) return;
+      supplementing = true;
+      renderFilters();
+      const web = await getConfig().then((c) => c.web_search).catch(() => false);
+      const wait = web && h("div", { class: "banner banner--info" }, icon("sparkles"), `正在联网搜索「${state.trip.city}」的攻略来补充地点，大约 20–30 秒，可以先继续挑选…`);
+      if (wait) notice.prepend(wait);
       try {
         const have = new Set(places().map((p) => p.name));
-        const extra = (await fetchRecommended()).filter((p) => !have.has(p.name));
+        const extra = (await fetchRecommended()).filter((p) => !have.has(p.name)).map((p) => ({ ...p, selected: false }));
+        if (!ctx.alive()) return;
         state.places = [...places(), ...extra];
         persistDraft();
-        toast(extra.length ? `补充了 ${extra.length} 个候选地点，勾选想去的即可` : "景点库里的地点都已经在列表里了");
-        renderAll();
+        toast(extra.length ? `补充了 ${extra.length} 个候选地点，勾选想去的即可` : "推荐的地点都已经在列表里了");
       } catch (e) {
-        toastError(e);
+        if (e.name !== "AbortError") toastError(e);
       } finally {
-        btn.classList.remove("is-loading");
+        supplementing = false;
+        wait?.remove();
+        if (ctx.alive()) (renderAll(), map?.fit());
       }
     }
 
@@ -149,11 +171,14 @@ export default {
               !ok && h("span", { class: "tag tag--seal" }, "缺少坐标"),
               p.source === "video" && h("span", { class: "tag tag--sea" }, "来自视频"),
               p.source === "inspiration" && h("span", { class: "tag tag--sea" }, "来自你的笔记"),
-              p.source === "custom" && h("span", { class: "tag tag--sun" }, "自己添加")),
+              p.source === "custom" && h("span", { class: "tag tag--sun" }, "自己添加"),
+              p.source === "ai_discover" && h("span", { class: "tag tag--sea", title: p.source_label || "" }, p.source_label?.startsWith("大模型知识") ? "AI 推荐 · 待核实" : "联网推荐")),
             p.reason && h("span", { class: "place-reason" }, p.reason),
+            p.tips && p.source === "ai_discover" && h("span", { class: "place-tip" }, icon("alert"), p.tips),
             h("span", { class: "place-meta" },
               (p.keywords || []).slice(0, 3).map((k) => h("span", { class: "tag" }, k)),
               p.duration_min && h("span", { class: "faint" }, icon("clock"), `约 ${p.duration_min} 分钟`),
+              (p.sources || []).slice(0, 2).map((s) => h("a", { class: "place-link place-src", href: s.url, target: "_blank", rel: "noopener noreferrer", title: s.title, onclick: (e) => e.stopPropagation() }, "出处：", s.title.length > 14 ? `${s.title.slice(0, 14)}…` : s.title)),
               h("a", { class: "place-link", href: p.douyin_search_url || douyinUrl(p.name), target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, "在抖音看看", icon("external"))))
         )
       );
@@ -177,7 +202,7 @@ export default {
           } }), h("span", { class: "switch-track" }), "只看符合我风格的"),
           h("span", { class: "filter-actions" },
             places().some((p) => p.source === "video" || p.source === "inspiration") && !places().some((p) => p.source === "builtin" || p.source === "ai_discover") &&
-              h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: (e) => addRecommended(e.currentTarget) }, icon("plus"), "补充推荐地点"),
+              h("button", { class: ["btn btn--ghost btn--sm", supplementing && "is-loading"], type: "button", disabled: supplementing, onclick: addRecommended }, icon("plus"), supplementing ? "正在补充…" : "补充推荐地点"),
             h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: () => {
               shown.forEach((p) => hasCoords(p) && (allOn ? state.selectedIds.delete(p.id) : state.selectedIds.add(p.id)));
               renderAll();
@@ -211,8 +236,9 @@ export default {
       if (!p?.mbti) return echo.replaceChildren();
       const pr = styleProfile();
       const tags = [pr.di_label, pr.rl_label, pr.ps_label, pr.cd_label].join(" · ");
-      const fromYou = places().some((x) => x.source === "video" || x.source === "inspiration");
-      mountInto(echo, icon("compass"), h("span", null, "根据你的旅行人格 ", h("b", null, `${p.personality?.name}（${p.mbti}）`), `，${fromYou ? "从你的灵感素材里找到" : "为你准备"}了 `, h("b", null, places().length), " 个地点，已按「", tags, "」预选。"));
+      const fromYou = places().filter((x) => x.source === "video" || x.source === "inspiration").length;
+      const head = fromYou === places().length ? "从你的灵感素材里找到了 " : "为你准备了 ";
+      mountInto(echo, icon("compass"), h("span", null, "根据你的旅行人格 ", h("b", null, `${p.personality?.name}（${p.mbti}）`), `，${head}`, h("b", null, places().length), ` 个地点${fromYou && fromYou < places().length ? `（${fromYou} 个来自你的灵感素材）` : ""}，已按「`, tags, "」预选。"));
     }
 
     function refreshMap() {
@@ -300,7 +326,6 @@ export default {
     (async () => {
       await load();
       if (!ctx.alive()) return;
-      notice.replaceChildren();
       map = await createMapView(mapEl, {
         onMarkerClick: (id) => {
           const el = list.querySelector(`[data-id="${CSS.escape(id)}"]`);
