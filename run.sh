@@ -1,31 +1,44 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# 一拍迹合 · 一键启动（macOS / Linux）
+# 创建虚拟环境 → 安装依赖 → 启动服务并打开浏览器
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# 旅搭子 - 启动脚本
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    PY="$c"; break
+  fi
+done
+[ -n "$PY" ] || { echo "❌ 需要 Python 3.10 及以上版本：https://www.python.org/downloads/"; exit 1; }
 
-echo "🚀 启动旅搭子..."
-echo ""
-
-# 检查 Python 环境
-if ! command -v python3 &> /dev/null; then
-    echo "❌ 未找到 Python3，请先安装"
-    exit 1
+if [ ! -x .venv/bin/python ]; then
+  echo "📦 创建虚拟环境 .venv ..."
+  "$PY" -m venv .venv
 fi
 
-# 检查依赖
-if ! python3 -c "import flask" 2>/dev/null; then
-    echo "📦 安装依赖..."
-    pip3 install -r requirements.txt
+# 官方源装不上（国内网络常见）时自动改用清华镜像
+pip_install() {
+  .venv/bin/python -m pip install --disable-pip-version-check "$@" \
+    || .venv/bin/python -m pip install --disable-pip-version-check -i https://pypi.tuna.tsinghua.edu.cn/simple "$@"
+}
+
+if ! .venv/bin/python -c "import flask, flask_cors, dotenv, openai, requests" 2>/dev/null; then
+  echo "📦 安装依赖（首次约 1 分钟）..."
+  pip_install -q --upgrade pip
+  pip_install -q -r requirements.txt
 fi
 
-# 检查 .env
+# 视频分析组件（本地语音转写 + 截取画面）：可选，装不上不影响其他功能；设置 SKIP_VIDEO_DEPS=1 可跳过
+if [ "${SKIP_VIDEO_DEPS:-0}" != "1" ] && ! .venv/bin/python -c "import faster_whisper, av, PIL, yt_dlp" 2>/dev/null; then
+  echo "🎧 安装视频分析组件（本地语音转写 + 多平台视频下载，约 100MB，只需一次）..."
+  pip_install -r requirements-video.txt || echo "⚠️  视频分析组件没装上，将跳过「听语音」，其他功能不受影响"
+fi
+
 if [ ! -f .env ]; then
-    echo "📝 未找到 .env 文件，使用 Demo 模式（无 LLM）"
-    echo "   如需 LLM 支持，请复制 .env.example 为 .env 并配置 API Key"
-    echo ""
+  cp .env.example .env
+  echo "📝 已生成 .env（全部留空即可运行；填上 DEEPSEEK_API_KEY 即可开启大模型、联网搜索和看画面）"
 fi
 
-echo "✅ 启动完成！"
-echo "🌐 访问 http://localhost:5000"
-echo ""
-
-python3 app.py
+export OPEN_BROWSER="${OPEN_BROWSER:-1}"
+exec .venv/bin/python app.py

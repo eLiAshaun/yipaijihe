@@ -35,3 +35,6 @@ agent-reach/tools/*/.venv/
 agent-reach/tools/*/uv.lock
 agent-reach/output/*.txt
 .env
+
+# Test
+.pytest_cache/

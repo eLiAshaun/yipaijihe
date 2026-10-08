@@ -83,13 +83,37 @@ def init_db():
         )
     """)
 
+    # 行程表（取代 users.travel_history 这个 JSON 大字段：可单条增删改、可分享）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trips (
+            id          TEXT    PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title       TEXT    NOT NULL DEFAULT '',
+            city        TEXT    NOT NULL DEFAULT '上海',
+            days        INTEGER NOT NULL DEFAULT 1,
+            budget      INTEGER NOT NULL DEFAULT 0,
+            companions  TEXT    NOT NULL DEFAULT '',
+            start_date  TEXT,
+            mbti_type   TEXT,
+            itinerary   TEXT    NOT NULL,
+            meta        TEXT,
+            share_token TEXT    UNIQUE,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # 索引
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_user ON trips(user_id, updated_at DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_attractions_city ON attractions(city)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_attractions_type ON attractions(type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_token)")
 
     conn.commit()
+
+    _ensure_columns(conn)
+    _migrate_legacy_history(conn)
 
     # ========== 种子数据（仅首次） ==========
     cursor.execute("SELECT COUNT(*) FROM attractions")
@@ -169,3 +193,61 @@ def _seed_data(conn):
     ))
 
     conn.commit()
+
+
+def _migrate_legacy_history(conn):
+    """把旧版 users.travel_history（JSON 数组）搬进 trips 表，只执行一次（搬完清空原字段）。"""
+    import uuid
+
+    rows = conn.execute(
+        "SELECT id, travel_history FROM users WHERE travel_history IS NOT NULL AND travel_history != '' AND travel_history != '[]'"
+    ).fetchall()
+    for row in rows:
+        try:
+            history = json.loads(row["travel_history"])
+        except (TypeError, ValueError):
+            continue
+        for trip in history if isinstance(history, list) else []:
+            if not isinstance(trip, dict) or not trip.get("itinerary"):
+                continue
+            digits = "".join(ch for ch in str(trip.get("budget", "")) if ch.isdigit())
+            conn.execute(
+                """INSERT INTO trips (id, user_id, title, city, days, budget, companions, mbti_type, itinerary)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    uuid.uuid4().hex,
+                    row["id"],
+                    (trip.get("itinerary") or {}).get("summary", "")[:60],
+                    trip.get("city", "上海"),
+                    int(trip.get("days") or 1),
+                    int(digits) if digits else 0,
+                    trip.get("companions", ""),
+                    trip.get("mbti_type"),
+                    json.dumps(trip["itinerary"], ensure_ascii=False),
+                ),
+            )
+        conn.execute("UPDATE users SET travel_history = NULL WHERE id = ?", (row["id"],))
+    if rows:
+        conn.commit()
+        logger.info("已迁移 %d 位用户的旧版旅行历史到 trips 表", len(rows))
+
+
+def list_cities():
+    """返回有内置景点库的城市（含中心坐标），供前端城市选择与天气查询使用"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT c.name, c.center_lat, c.center_lng, COUNT(a.id) AS n "
+            "FROM cities c LEFT JOIN attractions a ON a.city = c.name GROUP BY c.name ORDER BY n DESC"
+        ).fetchall()
+        return [{"name": r["name"], "lat": r["center_lat"], "lng": r["center_lng"], "places": r["n"]} for r in rows]
+    finally:
+        conn.close()
+
+
+def _ensure_columns(conn):
+    """给旧数据库补上新增的列（SQLite 没有 IF NOT EXISTS 的 ADD COLUMN）"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "is_guest" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_guest INTEGER NOT NULL DEFAULT 0")
+        conn.commit()

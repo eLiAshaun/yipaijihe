@@ -1,0 +1,28 @@
+# Render Blueprint：New → Blueprint → 选中本仓库即可
+services:
+  - type: web
+    name: yipaijihe
+    runtime: docker
+    plan: starter            # 持久化磁盘需要付费实例；免费实例可去掉 disk（数据会在重启后丢失）
+    healthCheckPath: /api/health
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DB_PATH
+        value: /data/luvdazi.db
+      - key: ASR_MODEL_DIR
+        value: /data/models
+      - key: DEEPSEEK_API_KEY
+        sync: false          # 以下 Key 在 Render 控制台填写，不进仓库；全部留空也能运行（本地行程引擎 + 内置景点库）
+      - key: LLM_API_KEY
+        sync: false
+      - key: MIMO_API_KEY
+        sync: false
+      - key: DOUBAO_API_KEY
+        sync: false
+      - key: AMAP_JS_KEY
+        sync: false
+      - key: AMAP_SECURITY_CODE
+        sync: false

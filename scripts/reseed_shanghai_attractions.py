@@ -13,7 +13,7 @@
 （CITY_CENTER 的中心坐标等信息没有变化，因此不需要重新写入 cities 表）。
 
 用法（在项目根目录下执行）：
-    python reseed_shanghai_attractions.py
+    python scripts/reseed_shanghai_attractions.py
 """
 
 import json
@@ -21,7 +21,7 @@ import logging
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("reseed")

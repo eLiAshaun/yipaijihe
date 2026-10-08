@@ -1,9 +1,13 @@
 """
-视频处理器 - 下载视频、提取音频、切片并行转写
+视频处理器：解析抖音分享链接 → 下载 → 听语音（本地 Whisper / MiMo）+ 看画面（多模态大模型）
+
+understand() 是对外的完整流程，每一步都可以单独失败而不影响其他步骤：
+没下载成功就只用标题；语音模型没准备好就只看画面；不支持看图就只听语音。
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -15,7 +19,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import ffmpeg
 import requests
 from openai import OpenAI
 
@@ -78,8 +81,8 @@ class VideoProcessor:
     def __del__(self):
         self.cleanup()
 
-    def parse_share_url(self, share_text: str) -> dict:
-        """从分享文本中提取视频信息（复用 MCP server 逻辑）"""
+    def _load_share_item(self, share_text: str, timeout=REQUEST_TIMEOUT) -> tuple[dict, str]:
+        """解析分享链接，返回抖音页面里的作品数据（视频与图文笔记都支持）"""
         urls = re.findall(
             r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
             share_text,
@@ -97,7 +100,7 @@ class VideoProcessor:
             video_id = video_id_match.group(2)
         else:
             # 短链接跟随重定向
-            resp = requests.get(share_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(share_url, headers=HEADERS, allow_redirects=True, timeout=timeout)
             resp.raise_for_status()
             final_url = resp.url
             if "douyin.com" in final_url and "/video/" not in final_url and "/note/" not in final_url:
@@ -109,7 +112,7 @@ class VideoProcessor:
 
         # 获取视频页面
         page_url = f"https://www.iesdouyin.com/share/{share_type}/{video_id}"
-        resp = requests.get(page_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(page_url, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
 
         pattern = re.compile(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", re.DOTALL)
@@ -123,32 +126,12 @@ class VideoProcessor:
         info = page.get("videoInfoRes", {})
         items = info.get("item_list", [])
         if not items:
-            raise ValueError(f"视频不存在或已被删除 (ID: {video_id})")
-
-        item = items[0]
-        video = item.get("video") or {}
-        url_list = video.get("play_addr", {}).get("url_list", [])
-        if not url_list:
-            raise ValueError("该链接没有可下载的视频音轨，无法转写")
-        video_url = url_list[0].replace("playwm", "play")
-        desc = re.sub(r'[\\/:*?"<>|]', "_", item.get("desc", "").strip() or f"douyin_{video_id}")
-
-        return {"url": video_url, "title": desc, "video_id": video_id}
-
-    def download_video(self, video_url: str) -> Path:
-        """下载视频到临时目录"""
-        video_path = self.temp_dir / "video.mp4"
-        with requests.get(video_url, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT) as resp:
-            resp.raise_for_status()
-            with open(video_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        logger.info(f"视频下载完成: {video_path.stat().st_size / 1024 / 1024:.1f}MB")
-        return video_path
+            raise ValueError("抖音没有返回作品数据（作品可能已删除 / 仅自己可见，或当前网络访问抖音受限）")
+        return items[0], video_id
 
     def extract_audio(self, video_path: Path) -> Path:
         """从视频提取适合 ASR 的轻量音频。"""
+        import ffmpeg  # 延迟导入：只有真正处理音频时才需要 ffmpeg
         audio_path = video_path.with_suffix(".mp3")
         (
             ffmpeg.input(str(video_path))
@@ -167,6 +150,7 @@ class VideoProcessor:
 
     def split_audio(self, audio_path: Path, segment_duration: int = ASR_SEGMENT_DURATION) -> list[Path]:
         """将音频切片为多个片段"""
+        import ffmpeg  # 延迟导入：只有真正处理音频时才需要 ffmpeg
         probe = ffmpeg.probe(str(audio_path))
         duration = float(probe["format"]["duration"])
         num_segments = math.ceil(duration / segment_duration)
@@ -261,44 +245,234 @@ class VideoProcessor:
         # 按顺序合并
         return "\n".join(r for r in results if r)
 
-    def process_video(self, share_url: str) -> tuple[str, str, str]:
-        """
-        完整流程：解析 → 下载 → 提取音频 → 切片 → 并行转写
+    # ------------------------------------------------------------ 新流程 ----
+    MAX_VIDEO_MB = 200
 
-        Returns:
-            (transcript, video_title, error_msg)
-        """
-        video_title = ""
+    @staticmethod
+    def media_of(item: dict) -> dict:
+        """从作品数据里取出：标题、视频地址、封面、图文笔记的图片、时长（秒）"""
+        video = item.get("video") or {}
+        play = (video.get("play_addr") or {}).get("url_list") or []
+        cover = ((video.get("origin_cover") or video.get("cover") or {}).get("url_list") or [None])[0]
+        images = []
+        for img in item.get("images") or []:
+            urls = (img or {}).get("url_list") or []
+            if urls:
+                images.append(urls[-1] if len(urls) > 1 else urls[0])
+        return {
+            "title": (item.get("desc") or "").strip(),
+            "video_url": play[0].replace("playwm", "play") if play and not images else "",
+            "cover": cover,
+            "images": images,
+            "duration": int((video.get("duration") or 0) / 1000),
+        }
+
+    def download_video_limited(self, video_url: str) -> Path:
+        """下载视频（超过 MAX_VIDEO_MB 直接放弃，避免把磁盘 / 内存占满）"""
+        video_path = self.temp_dir / "video.mp4"
+        limit = self.MAX_VIDEO_MB * 1024 * 1024
+        got = 0
+        with requests.get(video_url, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT) as resp:
+            resp.raise_for_status()
+            if int(resp.headers.get("Content-Length") or 0) > limit:
+                raise ValueError(f"视频超过 {self.MAX_VIDEO_MB}MB，跳过下载")
+            with open(video_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    got += len(chunk)
+                    if got > limit:
+                        raise ValueError(f"视频超过 {self.MAX_VIDEO_MB}MB，跳过下载")
+                    f.write(chunk)
+        logger.info("视频下载完成: %.1fMB", got / 1024 / 1024)
+        return video_path
+
+    @staticmethod
+    def fetch_images(urls: list[str], limit: int = 8) -> list[bytes]:
+        from backend.services.vision import to_jpeg
+
+        out = []
+        for url in urls[:limit]:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=(5, 15))
+                resp.raise_for_status()
+                jpg = to_jpeg(resp.content)
+                if jpg:
+                    out.append(jpg)
+            except Exception as e:  # noqa: BLE001
+                logger.info("图片下载失败: %s", e)
+        return out
+
+    @staticmethod
+    def frames(video_path: Path, count: int = 8) -> list[bytes]:
+        """均匀截取关键帧（PyAV 解码，不需要系统 ffmpeg）。没装 PyAV / Pillow 时返回空列表。"""
         try:
-            # 1. 解析视频信息
-            logger.info(f"[VideoProcessor] 解析视频链接...")
-            video_info = self.parse_share_url(share_url)
-            video_title = video_info["title"]
-            logger.info(f"[VideoProcessor] 视频标题: {video_title}")
+            import av
+        except ImportError:
+            return []
+        from backend.services.vision import to_jpeg
 
-            # 2. 下载视频
-            logger.info(f"[VideoProcessor] 下载视频...")
-            video_path = self.download_video(video_info["url"])
+        out = []
+        try:
+            with av.open(str(video_path)) as container:
+                stream = container.streams.video[0]
+                duration = (container.duration or 0) / 1_000_000 or float(stream.duration * stream.time_base if stream.duration else 0)
+                if duration <= 0:
+                    return []
+                # 跳过开头 0.5 秒（常是黑屏），在剩余时长里等距取帧
+                points = [0.5 + (duration - 0.5) * (i + 0.5) / count for i in range(count)]
+                for t in points:
+                    container.seek(int(t / stream.time_base), stream=stream, any_frame=False, backward=True)
+                    for frame in container.decode(stream):
+                        buf = io.BytesIO()
+                        frame.to_image().save(buf, "PNG")
+                        jpg = to_jpeg(buf.getvalue())
+                        if jpg:
+                            out.append(jpg)
+                        break
+        except Exception as e:  # noqa: BLE001
+            logger.warning("截取视频画面失败: %s", e)
+        return out
 
-            # 3. 提取音频
-            logger.info(f"[VideoProcessor] 提取音频...")
-            audio_path = self.extract_audio(video_path)
+    def transcribe_any(self, video_path: Path, hints: list[str], on_progress=None) -> str:
+        """按配置选择转写引擎：MiMo 云端（需要系统 ffmpeg 切片）或本地 Whisper"""
+        from backend.services import asr
 
-            # 4. 切片
-            logger.info(f"[VideoProcessor] 切片音频...")
-            segments = self.split_audio(audio_path)
+        if asr.engine() == "mimo":
+            try:
+                segments = self.split_audio(self.extract_audio(video_path))
+                return self.transcribe_parallel(segments)
+            except Exception as e:  # noqa: BLE001 — 没装 ffmpeg / MiMo 出错：有本地模型就用本地的
+                if not (Config.HAS_LOCAL_ASR and asr.status()["ready"]):
+                    raise
+                logger.warning("MiMo 转写失败，改用本地 Whisper：%s", e)
+        return asr.transcribe_local(str(video_path), hints, on_progress=on_progress)
 
-            # 5. 并行转写
-            logger.info(f"[VideoProcessor] 并行转写 {len(segments)} 个片段...")
-            transcript = self.transcribe_parallel(segments)
+    # 抖音用分享页解析（不需要任何组件）；其他平台、以及抖音解析失败时交给 yt-dlp
+    DOUYIN_HOSTS = ("douyin.com", "iesdouyin.com", "amemv.com")
+    MAX_DOWNLOAD_SECONDS = 30 * 60
 
-            if not transcript.strip():
-                return None, video_title, "ASR 未返回有效文本"
+    @classmethod
+    def is_douyin(cls, url: str) -> bool:
+        from urllib.parse import urlparse
 
-            return transcript, video_title, ""
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == d or host.endswith("." + d) for d in cls.DOUYIN_HOSTS)
 
-        except Exception as e:
-            logger.error(f"[VideoProcessor] 处理失败: {e}")
-            return None, video_title, str(e)
+    def _media_via_ytdlp(self, url: str) -> dict:
+        from backend.services import reach
+
+        info = reach.ytdlp_info(url)
+        return {
+            "title": info["title"],
+            "description": info["description"],
+            "video_url": url,
+            "cover": info["thumbnail"],
+            "images": [],
+            "duration": info["duration"],
+            "via": "ytdlp",
+        }
+
+    def _download(self, media: dict, want_asr: bool, want_vision: bool) -> tuple[Path | None, Path | None]:
+        """返回 (给语音用的文件, 给画面用的文件)。yt-dlp 只选单文件格式，不需要 ffmpeg 合并音视频。"""
+        if media.get("via") != "ytdlp":
+            path = self.download_video_limited(media["video_url"])
+            return path, path
+        from backend.services.reach import ytdlp_download
+
+        url = media["video_url"]
+        if want_asr and want_vision:
+            try:
+                # height<=? ：不知道分辨率的格式（直链、部分平台）也接受
+                path = ytdlp_download(url, "b[height<=?480]/b[height<=?720]", self.temp_dir, "media")
+                return path, path
+            except Exception:  # noqa: BLE001 — B 站 / YouTube 多是音视频分离，分别下载
+                pass
+        audio = ytdlp_download(url, "ba[ext=m4a]/ba/b[height<=?480]/b", self.temp_dir, "audio") if want_asr else None
+        video = ytdlp_download(url, "bv[height<=?480]/b[height<=?480]/bv/b", self.temp_dir, "video") if want_vision else None
+        return audio, video
+
+    def understand(self, share_text: str, city: str = "", hints: list[str] | None = None, progress=None) -> dict:
+        """
+        完整流程。返回 {title, description, page_text, transcript, seen(看画面结果), steps(做了哪些), notes(哪些没做以及原因)}。
+          · 抖音：分享页解析（失败时用 yt-dlp 再试）
+          · B 站 / YouTube / 小红书 / 西瓜视频：yt-dlp
+          · 都拿不到视频时（例如小红书图文笔记）：用 Jina Reader 读网页正文
+        什么都读不到时抛出异常（调用方退回只用分享文案）。
+        """
+        from backend.services import asr, reach, vision
+
+        step = progress or (lambda *_: None)
+        out = {"title": "", "description": "", "page_text": "", "transcript": "", "seen": {"text": [], "places": [], "summary": ""}, "steps": [], "notes": []}
+        url = share_text.strip()
+        try:
+            step("读取视频信息")
+            media, errors = None, []
+            if self.is_douyin(url):
+                try:
+                    item, _ = self._load_share_item(url, timeout=(5, 12))
+                    media = self.media_of(item)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(str(e)[:80])
+            if media is None and reach.ytdlp_available():
+                try:
+                    media = self._media_via_ytdlp(url)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"yt-dlp：{str(e).replace('ERROR: ', '')[:80]}")
+            elif media is None and not self.is_douyin(url):
+                errors.append("没有安装 yt-dlp（安装 requirements-video.txt 后支持 B 站、YouTube、小红书等平台）")
+            if media is None:
+                page = reach.read_url(url, limit=6000, timeout=20)
+                if page["text"]:
+                    out.update(title=page["title"], page_text=page["text"])
+                    out["steps"].append("page")
+                    out["notes"] += [f"没有拿到视频（{errors[-1]}），读了网页文字"] if errors else []
+                    return out
+                raise RuntimeError("；".join(errors) or page["error"] or "无法读取这个链接")
+
+            out["title"], out["description"] = media["title"], media.get("description", "")
+            out["steps"].append("title")
+
+            asr_state = asr.status()
+            too_long = media.get("duration", 0) > self.MAX_DOWNLOAD_SECONDS
+            want_asr = bool(media["video_url"]) and asr_state["ready"] and not too_long
+            want_vision = Config.HAS_VISION and not too_long
+            if too_long:
+                out["notes"].append("视频超过 30 分钟，只读了标题和简介")
+            elif media["video_url"] and asr_state["engine"] == "local" and not asr_state["ready"]:
+                pct = f"（{asr_state['progress']}%）" if asr_state.get("progress") is not None else ""
+                out["notes"].append(f"本地语音模型还在准备{pct}，这次没有听语音" if asr_state["state"] != "error" else "本地语音模型加载失败，这次没有听语音")
+            elif media["video_url"] and asr_state["engine"] == "none":
+                out["notes"].append("没有开启语音转写（安装 requirements-video.txt 即可免费使用本地 Whisper）")
+
+            images: list[bytes] = []
+            if media["images"] and want_vision:
+                step("看图片")
+                images = self.fetch_images(media["images"])
+            elif media["video_url"] and (want_asr or want_vision):
+                step("下载视频")
+                try:
+                    audio_path, video_path = self._download(media, want_asr, want_vision)
+                except Exception as e:  # noqa: BLE001
+                    out["notes"].append(f"视频下载失败（{str(e).replace('ERROR: ', '')[:60]}）")
+                    audio_path = video_path = None
+                if audio_path and want_asr:
+                    step("听语音")
+                    try:
+                        out["transcript"] = self.transcribe_any(audio_path, hints or [], lambda pct: step(f"听语音 {pct}%"))
+                        if out["transcript"]:
+                            out["steps"].append("asr")
+                    except Exception as e:  # noqa: BLE001
+                        out["notes"].append(f"语音转写失败（{str(e)[:60]}）")
+                if video_path and want_vision:
+                    step("看画面")
+                    images = self.frames(video_path)
+            if want_vision and not images and media["cover"]:
+                step("看画面")
+                images = self.fetch_images([media["cover"]], 1)
+            if images:
+                seen = vision.read_images(images, media["title"], city)
+                if seen["text"] or seen["places"]:
+                    out["seen"] = seen
+                    out["steps"].append("vision")
+            return out
         finally:
             self.cleanup()

@@ -4,8 +4,9 @@
 
 import json
 from flask import Blueprint, jsonify, request
+from backend.config import Config
 from backend.database import get_db
-from backend.services.llm_service import discover_trip_attractions, filter_default_attractions
+from backend.services.llm_service import discover_trip_attractions
 
 locations_bp = Blueprint("locations", __name__)
 
@@ -98,40 +99,6 @@ def get_location(location_id):
         db.close()
 
 
-@locations_bp.route("/videos", methods=["GET"])
-def get_videos():
-    """获取模拟的抖音精选视频列表（从数据库读取地点后构造视频信息）"""
-    from backend.data.shanghai_locations import SHANGHAI_LOCATIONS
-
-    db = get_db()
-    try:
-        rows = db.execute("SELECT * FROM attractions ORDER BY id").fetchall()
-        videos = []
-        for row in rows:
-            # 用原始数据中的 video_source（数据库未存此字段，从 Python 数据补充）
-            loc_id = f"loc_{row['id']:03d}"
-            orig = next((l for l in SHANGHAI_LOCATIONS if l["id"] == loc_id), {})
-            vs = orig.get("video_source", {})
-
-            videos.append({
-                "id": f"video_{loc_id}",
-                "title": vs.get("title", f"探索{row['name']}"),
-                "author": vs.get("author", "@旅行达人"),
-                "likes": vs.get("likes", 10000),
-                "cover_color": vs.get("cover_color", "#333"),
-                "location_id": loc_id,
-                "location_name": row["name"],
-                "tags": json.loads(row["tags"]) if row["tags"] else [],
-                "description": row["description"] or "",
-                "category": row["category"],
-            })
-
-        videos.sort(key=lambda v: v["likes"], reverse=True)
-        return jsonify({"videos": videos})
-    finally:
-        db.close()
-
-
 @locations_bp.route("/city", methods=["GET"])
 def get_city_info():
     """获取城市信息"""
@@ -155,53 +122,80 @@ def get_city_info():
         db.close()
 
 
-# 静态默认推荐景点（降级方案）
-DEFAULT_RECOMMEND_ATTRACTIONS = [
-    {"name": "南京路", "type": "street", "lat": 31.2350, "lng": 121.4740, "keywords": ["购物", "步行街"], "video_hint": "上海最繁华的商业街"},
-    {"name": "豫园", "type": "culture", "lat": 31.2270, "lng": 121.4920, "keywords": ["古典园林", "小吃"], "video_hint": "江南园林与城隍庙小吃"},
-    {"name": "外滩", "type": "landmark", "lat": 31.2400, "lng": 121.4900, "keywords": ["夜景", "万国建筑"], "video_hint": "上海地标，必打卡"},
-    {"name": "东方明珠", "type": "landmark", "lat": 31.2397, "lng": 121.4998, "keywords": ["电视塔", "俯瞰"], "video_hint": "上海天际线标志"},
-    {"name": "陆家嘴", "type": "landmark", "lat": 31.2355, "lng": 121.5010, "keywords": ["金融中心", "摩天大楼"], "video_hint": "现代上海的代表"},
-    {"name": "四行仓库", "type": "culture", "lat": 31.2470, "lng": 121.4730, "keywords": ["历史", "抗战"], "video_hint": "铭记历史的红色景点"},
-    {"name": "武康路", "type": "street", "lat": 31.2100, "lng": 121.4380, "keywords": ["梧桐", "老洋房"], "video_hint": "网红打卡梧桐街道"},
-    {"name": "田子坊", "type": "street", "lat": 31.2130, "lng": 121.4660, "keywords": ["文创", "弄堂"], "video_hint": "文艺小店聚集地"},
-]
-
-
 @locations_bp.route("/default-recommend", methods=["POST"])
 def default_recommend():
     """
-    获取默认推荐景点
-    优先用豆包联网搜索发现热门地点，失败则降级到静态列表
-    请求体：{ "profile": {...}, "city": "上海", "days": 3 }
+    地点筛选页的候选地点：
+      · 开启联网搜索时：搜索「{城市}{天数}日游」攻略，大模型归纳地点并按人格预选，结果写入景点库
+      · 否则（或 web=false）：使用该城市的内置景点库，按旅行人格契合度排序并给出契合理由
+    请求体：{ "profile": {...}, "city": "上海", "days": 3, "web": true }
     """
-    data = request.get_json() or {}
-    profile = data.get("profile", {})
-    city = data.get("city", "上海")
-    days = data.get("days", 3)
+    from backend.routes.itinerary import persona_score
 
-    # 优先联网搜索
-    attractions = discover_trip_attractions(city, days, profile)
+    data = request.get_json(silent=True) or {}
+    profile = data.get("profile") or {}
+    city = (data.get("city") or "上海").strip()[:20]
+    try:
+        days = max(1, min(int(data.get("days") or 3), 14))
+    except (TypeError, ValueError):
+        days = 3
 
-    # 降级到静态列表（用显式标志位记录是否发生了降级，
-    # 不要靠"内容是否相同"去反推——filter_default_attractions 会原地修改/拷贝字典，
-    # 导致降级后的列表内容也可能与 DEFAULT_RECOMMEND_ATTRACTIONS 不完全相等，从而误判来源）
-    used_fallback = False
-    if not attractions:
-        used_fallback = True
-        attractions = [loc.copy() for loc in DEFAULT_RECOMMEND_ATTRACTIONS]
-        if profile:
-            attractions = filter_default_attractions(profile, attractions)
+    web, meta = ([], {})
+    if data.get("web", True):
+        web, meta = discover_trip_attractions(city, days, profile)
+        if web:
+            from backend.services.catalog import upsert_places
 
+            upsert_places(city, web)
+
+    db = get_db()
+    try:
+        rows = db.execute("SELECT * FROM attractions WHERE city = ?", (city,)).fetchall()
+        catalog = [_row_to_location(r) for r in rows]
+    finally:
+        db.close()
+    if not catalog and not web:
+        return jsonify({
+            "attractions": [],
+            "source": "none",
+            "message": (
+                f"「{city}」还没有内置景点库，联网搜索这次也没有拿到结果（请检查网络或大模型 Key），可以稍后重试，或在下方手动添加地点。"
+                if Config.HAS_WEB_SEARCH
+                else f"「{city}」还没有内置景点库。在 .env 里填上 DEEPSEEK_API_KEY 开启联网搜索后即可规划任意城市，或者在下方手动添加地点。"
+            ),
+        })
+
+    mbti = profile.get("mbti") or ""
+    labels = {"pace": profile.get("di_label"), "pref": profile.get("rl_label"), "exp": profile.get("ps_label"), "social": profile.get("cd_label")}
+    for loc in catalog:
+        score = persona_score(loc, mbti)
+        loc["fit_score"] = score
+        loc["reason"] = loc.get("tips") or loc.get("description") or ""
+        matched = [v for k, v in labels.items() if v and (loc.get("travel_style_fit") or {}).get(k) not in (None, "")]
+        if mbti and score >= 6 and matched:
+            loc["reason"] = f"契合你的{'、'.join(matched[:2])}偏好 · " + loc["reason"]
+    catalog.sort(key=lambda l: l.get("fit_score", 0), reverse=True)
+    if web:
+        # 联网结果在前（已按人格预选）；景点库里其余的地点附在后面，默认不勾选，想加随时勾上
+        have = {p.get("id") for p in web} | {p["name"] for p in web}
+        extra = [dict(l, selected=False, source="builtin") for l in catalog if l["id"] not in have and l["name"] not in have]
+        mode = meta.get("mode")
+        return jsonify({
+            "attractions": web + extra,
+            "source": "web_search",
+            "mode": mode,
+            "sources": meta.get("sources") or [],
+            "message": "以下地点由大模型凭自身知识整理（当前网络搜不到资料），营业信息出发前请再确认。" if mode == "knowledge" else "",
+            "query_phrase": f"{city}{days}日游攻略",
+        })
+    if mbti:
+        # 预选：契合度高的全部选上；不够时按契合度补足到「每天 3 个」，避免行程太空
+        enough = max(sum(1 for l in catalog if l["fit_score"] >= 6), days * 3)
+        for i, loc in enumerate(catalog):
+            loc["selected"] = i < enough
     return jsonify({
-        "attractions": attractions,
-        "source": "default" if used_fallback else "web_search",
-        # 显式告知前端是否发生了降级，前端可据此弹出提示，
-        # 避免用户在不知情的情况下一直看到"本地静态库"的内容、误以为是豆包搜索结果
-        "fallback": used_fallback,
-        "fallback_message": (
-            "豆包 AI 联网搜索调用失败或暂不可用，已自动切换为本地静态推荐景点库"
-            if used_fallback else ""
-        ),
+        "attractions": catalog,
+        "source": "local",
+        "message": "" if mbti else "完成旅行人格测试后，会按你的风格自动预选",
         "query_phrase": f"{city}{days}日游攻略",
     })

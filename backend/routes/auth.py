@@ -4,33 +4,53 @@
 
 import re
 import json
-import uuid
+import hmac
+import logging
+import secrets
 import hashlib
 from functools import wraps
 from flask import Blueprint, jsonify, request, g
+from werkzeug.security import generate_password_hash, check_password_hash
 from backend.database import get_db
+from backend.services import trips as trips_repo
+
+logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 
 # ========== 工具函数 ==========
 
-def _hash_password(password, salt=None):
-    """密码哈希（sha256 + salt）"""
-    if salt is None:
-        salt = uuid.uuid4().hex[:16]
-    hashed = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${hashed}"
+def _hash_password(password):
+    """密码哈希（werkzeug：scrypt + 随机盐）"""
+    return generate_password_hash(password)
+
+
+def _is_legacy_hash(stored_hash):
+    """旧版格式：`salt$sha256hex`（无 `method$` 前缀）"""
+    return bool(re.fullmatch(r"[0-9a-f]{16}\$[0-9a-f]{64}", stored_hash or ""))
 
 
 def _verify_password(password, stored_hash):
-    """验证密码"""
-    salt = stored_hash.split("$")[0]
-    return _hash_password(password, salt) == stored_hash
+    """验证密码，同时兼容旧版 sha256+salt 记录（登录成功后会自动升级）"""
+    if not stored_hash:
+        return False
+    if _is_legacy_hash(stored_hash):
+        salt = stored_hash.split("$")[0]
+        legacy = salt + "$" + hashlib.sha256((salt + password).encode()).hexdigest()
+        return hmac.compare_digest(legacy, stored_hash)
+    return check_password_hash(stored_hash, password)
 
 
 def _generate_token():
     """生成 session token"""
-    return uuid.uuid4().hex
+    return secrets.token_urlsafe(32)
+
+
+def _server_error(db, exc, action):
+    """统一的 500 处理：回滚 + 记日志，不把异常细节泄露给客户端"""
+    db.rollback()
+    logger.exception("%s失败: %s", action, exc)
+    return jsonify({"error": f"{action}失败，请稍后重试"}), 500
 
 
 def _get_current_user():
@@ -112,8 +132,60 @@ def register():
         }), 201
 
     except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error(db, e, "注册")
+    finally:
+        db.close()
+
+
+@auth_bp.route("/guest", methods=["POST"])
+def guest():
+    """游客模式：不用注册直接开始。数据同样保存在服务端，之后可在「设置账号」里转为正式账号。"""
+    db = get_db()
+    try:
+        for _ in range(5):
+            username = f"旅客{secrets.randbelow(900000) + 100000}"
+            if not db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                break
+        token = _generate_token()
+        cur = db.execute(
+            "INSERT INTO users (username, password_hash, session_token, is_guest) VALUES (?, ?, ?, 1)",
+            (username, _hash_password(secrets.token_urlsafe(24)), token),
+        )
+        db.commit()
+        return jsonify({"user": {"id": cur.lastrowid, "username": username, "is_guest": True}, "token": token}), 201
+    except Exception as e:
+        return _server_error(db, e, "创建游客")
+    finally:
+        db.close()
+
+
+@auth_bp.route("/account", methods=["PUT"])
+@login_required
+def claim_account():
+    """游客转正：设置用户名和密码，行程与人格测试结果全部保留"""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not g.user.get("is_guest"):
+        return jsonify({"error": "当前已经是正式账号"}), 400
+    if len(username) < 3 or len(username) > 20:
+        return jsonify({"error": "用户名长度需为 3-20 个字符"}), 400
+    if not re.match(r'^[a-zA-Z0-9_一-鿿]+$', username):
+        return jsonify({"error": "用户名只能包含字母、数字、下划线或中文"}), 400
+    if len(password) < 6 or len(password) > 20:
+        return jsonify({"error": "密码长度需为 6-20 个字符"}), 400
+    db = get_db()
+    try:
+        if db.execute("SELECT 1 FROM users WHERE username = ? AND id != ?", (username, g.user["id"])).fetchone():
+            return jsonify({"error": "用户名已存在"}), 409
+        db.execute(
+            "UPDATE users SET username = ?, password_hash = ?, is_guest = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (username, _hash_password(password), g.user["id"]),
+        )
+        db.commit()
+        return jsonify({"user": {"id": g.user["id"], "username": username, "is_guest": False}})
+    except Exception as e:
+        return _server_error(db, e, "设置账号")
     finally:
         db.close()
 
@@ -143,11 +215,12 @@ def login():
         if not user or not _verify_password(password, user["password_hash"]):
             return jsonify({"error": "用户名或密码错误"}), 401
 
-        # 更新 session token
+        # 更新 session token（旧版哈希顺带升级为 scrypt）
         token = _generate_token()
+        new_hash = _hash_password(password) if _is_legacy_hash(user["password_hash"]) else user["password_hash"]
         db.execute(
-            "UPDATE users SET session_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (token, user["id"])
+            "UPDATE users SET session_token = ?, password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (token, new_hash, user["id"])
         )
         db.commit()
 
@@ -162,8 +235,7 @@ def login():
         })
 
     except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error(db, e, "登录")
     finally:
         db.close()
 
@@ -176,9 +248,10 @@ def get_profile():
     profile = {
         "id": user["id"],
         "username": user["username"],
+        "is_guest": bool(user.get("is_guest")),
         "mbti_type": user["mbti_type"],
         "mbti_result": json.loads(user["mbti_result"]) if user["mbti_result"] else None,
-        "travel_history": json.loads(user["travel_history"]) if user["travel_history"] else [],
+        "travel_history": trips_repo.list_trips(user["id"], full=True),
         "created_at": user["created_at"],
     }
     return jsonify({"profile": profile})
@@ -207,8 +280,7 @@ def save_mbti():
         db.commit()
         return jsonify({"message": "MBTI 结果已保存", "mbti_type": mbti_type})
     except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error(db, e, "保存人格")
     finally:
         db.close()
 
@@ -216,47 +288,15 @@ def save_mbti():
 @auth_bp.route("/travel-history", methods=["POST"])
 @login_required
 def add_travel_history():
-    """
-    添加旅行历史
-    请求体：{ "city": "上海", "days": 2, "itinerary": { ... } }
-    """
-    data = request.get_json()
+    """兼容旧接口：添加旅行历史（新代码请用 POST /api/trips）"""
+    data = request.get_json(silent=True)
     if not data or not data.get("city"):
         return jsonify({"error": "请提供旅行信息"}), 400
-
-    from datetime import datetime
-
-    trip = {
-        "city": data["city"],
-        "days": data.get("days", 1),
-        "companions": data.get("companions", ""),
-        "budget": data.get("budget", ""),
-        "mbti_type": g.user["mbti_type"],
-        "itinerary": data.get("itinerary"),
-        "date": datetime.now().strftime("%Y-%m-%d"),
-    }
-
-    db = get_db()
     try:
-        # 读取现有历史
-        user = db.execute(
-            "SELECT travel_history FROM users WHERE id = ?", (g.user["id"],)
-        ).fetchone()
-
-        history = json.loads(user["travel_history"]) if user["travel_history"] else []
-        history.append(trip)
-
-        db.execute(
-            "UPDATE users SET travel_history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (json.dumps(history, ensure_ascii=False), g.user["id"])
-        )
-        db.commit()
-        return jsonify({"message": "旅行已记录", "trip": trip}), 201
-    except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        db.close()
+        trip = trips_repo.create_trip(g.user, data)
+    except trips_repo.TripError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"message": "旅行已记录", "trip": trip}), 201
 
 
 @auth_bp.route("/logout", methods=["POST"])
@@ -272,7 +312,6 @@ def logout():
         db.commit()
         return jsonify({"message": "已退出登录"})
     except Exception as e:
-        db.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error(db, e, "退出登录")
     finally:
         db.close()

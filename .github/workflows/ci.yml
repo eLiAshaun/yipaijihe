@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -r requirements-dev.txt
+      - name: Backend tests
+        run: python -m pytest -q
+      - name: Planner engine tests (Node)
+        run: node --test "tests/js/*.test.mjs"
+      - name: Frontend syntax check
+        run: |
+          for f in $(find frontend/js -name '*.js'); do
+            cp "$f" /tmp/check.mjs && node --check /tmp/check.mjs || { echo "syntax error in $f"; exit 1; }
+          done
