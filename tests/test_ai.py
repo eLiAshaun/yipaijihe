@@ -252,3 +252,11 @@ def test_text_extraction_prefers_longer_place_names(client, auth):
     names = [p["name"] for p in res["places"]]
     assert "北外滩" in names and "外滩夜景" not in names
     assert next(p for p in res["places"] if p["name"] == "北外滩")["reason"].startswith("晚上去了北外滩")
+
+
+def test_short_natural_landmarks_are_kept():
+    from backend.routes.video import _filter_extracted_locations
+
+    text = "打算去杭州，西湖边走走，再去灵隐寺，晚上河坊街吃东西，路过附近的商场，第二天去乌镇，住在桐乡市"
+    locs = [{"name": n, "type": "landmark"} for n in ("西湖", "灵隐寺", "河坊街", "商场", "附近", "乌镇", "桐乡市")]
+    assert [l["name"] for l in _filter_extracted_locations(locs, text)] == ["西湖", "灵隐寺", "河坊街", "乌镇"]
