@@ -78,11 +78,9 @@ class Config:
     # CORS：默认仅同源（前后端同域部署）。需要跨域时用逗号分隔填写来源。
     CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
-    # Database
-    DB_PATH = os.getenv("DB_PATH", os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "instance", "luvdazi.db"
-    ))
+    # Database（相对路径按项目根目录解析，从任何目录启动都用同一个数据库）
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DB_PATH = os.path.join(_ROOT, os.getenv("DB_PATH") or os.path.join("instance", "luvdazi.db"))
 
     # 判断是否配置了 LLM
     HAS_LLM = bool(LLM_API_KEY)
