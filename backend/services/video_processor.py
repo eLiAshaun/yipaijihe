@@ -332,7 +332,7 @@ class VideoProcessor:
             logger.warning("截取视频画面失败: %s", e)
         return out
 
-    def transcribe_any(self, video_path: Path, hints: list[str]) -> str:
+    def transcribe_any(self, video_path: Path, hints: list[str], on_progress=None) -> str:
         """按配置选择转写引擎：MiMo 云端（需要系统 ffmpeg 切片）或本地 Whisper"""
         from backend.services import asr
 
@@ -344,28 +344,100 @@ class VideoProcessor:
                 if not (Config.HAS_LOCAL_ASR and asr.status()["ready"]):
                     raise
                 logger.warning("MiMo 转写失败，改用本地 Whisper：%s", e)
-        return asr.transcribe_local(str(video_path), hints)
+        return asr.transcribe_local(str(video_path), hints, on_progress=on_progress)
+
+    # 抖音用分享页解析（不需要任何组件）；其他平台、以及抖音解析失败时交给 yt-dlp
+    DOUYIN_HOSTS = ("douyin.com", "iesdouyin.com", "amemv.com")
+    MAX_DOWNLOAD_SECONDS = 30 * 60
+
+    @classmethod
+    def is_douyin(cls, url: str) -> bool:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == d or host.endswith("." + d) for d in cls.DOUYIN_HOSTS)
+
+    def _media_via_ytdlp(self, url: str) -> dict:
+        from backend.services import reach
+
+        info = reach.ytdlp_info(url)
+        return {
+            "title": info["title"],
+            "description": info["description"],
+            "video_url": url,
+            "cover": info["thumbnail"],
+            "images": [],
+            "duration": info["duration"],
+            "via": "ytdlp",
+        }
+
+    def _download(self, media: dict, want_asr: bool, want_vision: bool) -> tuple[Path | None, Path | None]:
+        """返回 (给语音用的文件, 给画面用的文件)。yt-dlp 只选单文件格式，不需要 ffmpeg 合并音视频。"""
+        if media.get("via") != "ytdlp":
+            path = self.download_video_limited(media["video_url"])
+            return path, path
+        from backend.services.reach import ytdlp_download
+
+        url = media["video_url"]
+        if want_asr and want_vision:
+            try:
+                # height<=? ：不知道分辨率的格式（直链、部分平台）也接受
+                path = ytdlp_download(url, "b[height<=?480]/b[height<=?720]", self.temp_dir, "media")
+                return path, path
+            except Exception:  # noqa: BLE001 — B 站 / YouTube 多是音视频分离，分别下载
+                pass
+        audio = ytdlp_download(url, "ba[ext=m4a]/ba/b[height<=?480]/b", self.temp_dir, "audio") if want_asr else None
+        video = ytdlp_download(url, "bv[height<=?480]/b[height<=?480]/bv/b", self.temp_dir, "video") if want_vision else None
+        return audio, video
 
     def understand(self, share_text: str, city: str = "", hints: list[str] | None = None, progress=None) -> dict:
         """
-        完整流程。返回 {title, transcript, seen(看画面结果), steps(做了哪些), notes(哪些没做以及原因)}；
-        读取作品信息失败时抛出异常（调用方可以退回只用分享文案）。
+        完整流程。返回 {title, description, page_text, transcript, seen(看画面结果), steps(做了哪些), notes(哪些没做以及原因)}。
+          · 抖音：分享页解析（失败时用 yt-dlp 再试）
+          · B 站 / YouTube / 小红书 / 西瓜视频：yt-dlp
+          · 都拿不到视频时（例如小红书图文笔记）：用 Jina Reader 读网页正文
+        什么都读不到时抛出异常（调用方退回只用分享文案）。
         """
-        from backend.services import asr, vision
+        from backend.services import asr, reach, vision
 
         step = progress or (lambda *_: None)
-        out = {"title": "", "transcript": "", "seen": {"text": [], "places": [], "summary": ""}, "steps": [], "notes": []}
+        out = {"title": "", "description": "", "page_text": "", "transcript": "", "seen": {"text": [], "places": [], "summary": ""}, "steps": [], "notes": []}
+        url = share_text.strip()
         try:
             step("读取视频信息")
-            item, _ = self._load_share_item(share_text, timeout=(5, 12))
-            media = self.media_of(item)
-            out["title"] = media["title"]
+            media, errors = None, []
+            if self.is_douyin(url):
+                try:
+                    item, _ = self._load_share_item(url, timeout=(5, 12))
+                    media = self.media_of(item)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(str(e)[:80])
+            if media is None and reach.ytdlp_available():
+                try:
+                    media = self._media_via_ytdlp(url)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"yt-dlp：{str(e).replace('ERROR: ', '')[:80]}")
+            elif media is None and not self.is_douyin(url):
+                errors.append("没有安装 yt-dlp（安装 requirements-video.txt 后支持 B 站、YouTube、小红书等平台）")
+            if media is None:
+                page = reach.read_url(url, limit=6000, timeout=20)
+                if page["text"]:
+                    out.update(title=page["title"], page_text=page["text"])
+                    out["steps"].append("page")
+                    out["notes"] += [f"没有拿到视频（{errors[-1]}），读了网页文字"] if errors else []
+                    return out
+                raise RuntimeError("；".join(errors) or page["error"] or "无法读取这个链接")
+
+            out["title"], out["description"] = media["title"], media.get("description", "")
             out["steps"].append("title")
 
             asr_state = asr.status()
-            want_asr = bool(media["video_url"]) and asr_state["ready"]
-            want_vision = Config.HAS_VISION
-            if media["video_url"] and asr_state["engine"] == "local" and not asr_state["ready"]:
+            too_long = media.get("duration", 0) > self.MAX_DOWNLOAD_SECONDS
+            want_asr = bool(media["video_url"]) and asr_state["ready"] and not too_long
+            want_vision = Config.HAS_VISION and not too_long
+            if too_long:
+                out["notes"].append("视频超过 30 分钟，只读了标题和简介")
+            elif media["video_url"] and asr_state["engine"] == "local" and not asr_state["ready"]:
                 pct = f"（{asr_state['progress']}%）" if asr_state.get("progress") is not None else ""
                 out["notes"].append(f"本地语音模型还在准备{pct}，这次没有听语音" if asr_state["state"] != "error" else "本地语音模型加载失败，这次没有听语音")
             elif media["video_url"] and asr_state["engine"] == "none":
@@ -378,21 +450,21 @@ class VideoProcessor:
             elif media["video_url"] and (want_asr or want_vision):
                 step("下载视频")
                 try:
-                    path = self.download_video_limited(media["video_url"])
+                    audio_path, video_path = self._download(media, want_asr, want_vision)
                 except Exception as e:  # noqa: BLE001
-                    out["notes"].append(f"视频下载失败（{str(e)[:60]}）")
-                    path = None
-                if path and want_asr:
+                    out["notes"].append(f"视频下载失败（{str(e).replace('ERROR: ', '')[:60]}）")
+                    audio_path = video_path = None
+                if audio_path and want_asr:
                     step("听语音")
                     try:
-                        out["transcript"] = self.transcribe_any(path, hints or [])
+                        out["transcript"] = self.transcribe_any(audio_path, hints or [], lambda pct: step(f"听语音 {pct}%"))
                         if out["transcript"]:
                             out["steps"].append("asr")
                     except Exception as e:  # noqa: BLE001
                         out["notes"].append(f"语音转写失败（{str(e)[:60]}）")
-                if path and want_vision:
+                if video_path and want_vision:
                     step("看画面")
-                    images = self.frames(path)
+                    images = self.frames(video_path)
             if want_vision and not images and media["cover"]:
                 step("看画面")
                 images = self.fetch_images([media["cover"]], 1)

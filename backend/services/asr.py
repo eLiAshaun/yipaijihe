@@ -109,7 +109,7 @@ def _load() -> None:
             logger.error("本地语音模型加载失败：%s", e)
 
 
-def transcribe_local(media_path: str, hints: list[str] | None = None, max_seconds: int | None = None) -> str:
+def transcribe_local(media_path: str, hints: list[str] | None = None, max_seconds: int | None = None, on_progress=None) -> str:
     """
     本地转写音 / 视频文件（PyAV 解码，不需要系统装 ffmpeg）。
     hints：可能出现的地名，作为 Whisper 的提示词能明显减少地名同音错字，也让输出保持简体中文。
@@ -121,18 +121,24 @@ def transcribe_local(media_path: str, hints: list[str] | None = None, max_second
     if hints:
         prompt += "可能提到：" + "、".join(dict.fromkeys(h for h in hints if h))[:300] + "。"
     with _run_lock:
-        segments, _ = _model.transcribe(
+        # 贪心解码（beam_size=1）在 CPU 上快一倍左右；地名错字由后面的大模型校对结合画面字幕改正
+        segments, info = _model.transcribe(
             media_path,
             language="zh",
-            beam_size=3,
+            beam_size=1,
             vad_filter=True,
             initial_prompt=prompt,
             condition_on_previous_text=False,
         )
-        text = ""
+        total = min(info.duration or max_seconds, max_seconds) or 1
+        text, last = "", 0
         for seg in segments:
             if seg.start > max_seconds:
                 break
+            pct = min(99, int(seg.end * 100 / total))
+            if on_progress and pct - last >= 5:
+                last = pct
+                on_progress(pct)
             piece = seg.text.strip()
             if piece:
                 text += piece if not text or text[-1] in "，。！？、；：,.!?" else "，" + piece

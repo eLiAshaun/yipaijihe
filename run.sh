@@ -30,8 +30,8 @@ if ! .venv/bin/python -c "import flask, flask_cors, dotenv, openai, requests" 2>
 fi
 
 # 视频分析组件（本地语音转写 + 截取画面）：可选，装不上不影响其他功能；设置 SKIP_VIDEO_DEPS=1 可跳过
-if [ "${SKIP_VIDEO_DEPS:-0}" != "1" ] && ! .venv/bin/python -c "import faster_whisper, av, PIL" 2>/dev/null; then
-  echo "🎧 安装视频分析组件（本地语音转写，约 100MB，只需一次）..."
+if [ "${SKIP_VIDEO_DEPS:-0}" != "1" ] && ! .venv/bin/python -c "import faster_whisper, av, PIL, yt_dlp" 2>/dev/null; then
+  echo "🎧 安装视频分析组件（本地语音转写 + 多平台视频下载，约 100MB，只需一次）..."
   pip_install -r requirements-video.txt || echo "⚠️  视频分析组件没装上，将跳过「听语音」，其他功能不受影响"
 fi
 

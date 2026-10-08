@@ -98,6 +98,9 @@ def create_app():
             "vision": caps["vision"],
             "asr": caps["asr"],
             "asr_status": caps["asr_engine"],
+            # 能分析的视频平台（抖音分享页解析不需要额外组件，其余平台需要 yt-dlp）与是否能读文章链接
+            "video_platforms": ["抖音", "B 站", "YouTube", "小红书", "西瓜视频"] if Config.HAS_YTDLP else ["抖音"],
+            "reader": Config.HAS_READER,
             # 有内置景点库的城市；开启联网搜索后可以规划任意城市
             "cities": list_cities(),
         }

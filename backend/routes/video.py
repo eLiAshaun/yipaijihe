@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import threading
@@ -22,8 +21,14 @@ video_bp = Blueprint("video", __name__)
 # 并行处理线程池（最多同时处理 3 个视频，避免资源争抢）
 _executor = ThreadPoolExecutor(max_workers=3)
 
-# 服务端会主动请求用户提交的链接 —— 只允许抖音系域名，防止被当作 SSRF 跳板
-_ALLOWED_VIDEO_HOSTS = ("douyin.com", "iesdouyin.com", "amemv.com")
+# 服务端会主动请求用户提交的链接 —— 只允许这些视频平台的域名，防止被当作 SSRF 跳板
+# 抖音走分享页解析；其余平台由 yt-dlp 下载（选型参照 Agent Reach）
+_ALLOWED_VIDEO_HOSTS = (
+    "douyin.com", "iesdouyin.com", "amemv.com",
+    "bilibili.com", "b23.tv", "youtube.com", "youtu.be",
+    "xiaohongshu.com", "xhslink.com", "ixigua.com",
+)
+VIDEO_PLATFORMS = "抖音 / B 站 / YouTube / 小红书 / 西瓜视频"
 MAX_VIDEO_URLS = 10
 
 
@@ -73,7 +78,7 @@ def _context_for(url: str, share_text: str) -> str:
     return ""
 
 
-_STEP_LABEL = {"title": "读了标题", "asr": "听了语音", "vision": "看了画面"}
+_STEP_LABEL = {"title": "读了标题和简介", "page": "读了网页文字", "asr": "听了语音", "vision": "看了画面"}
 
 
 def _process_single_video(url: str, index: int, total: int, mbti: str, share_text: str = "", city: str = "上海", catalog: list | None = None, progress=None) -> dict:
@@ -86,13 +91,25 @@ def _process_single_video(url: str, index: int, total: int, mbti: str, share_tex
     from backend.services.video_processor import VideoProcessor
     from backend.services import vision
 
-    step = progress or (lambda *_: None)
+    import time as _time
+
+    t0, last = _time.time(), [""]
+
+    def step(stage: str):
+        # 记录每个阶段的耗时，方便看时间花在哪（百分比进度不单独记）
+        name = stage.split(" ")[0]
+        if name != last[0]:
+            logger.info("[%d/%d] %.1fs → %s", index + 1, total, _time.time() - t0, name)
+            last[0] = name
+        if progress:
+            progress(stage)
+
     url = url.strip()
     base = {"index": index, "url": url, "title": "", "transcript": None, "screen": "", "locations": [], "error": None, "mode": "", "notes": []}
     logger.info(f"[{index+1}/{total}] 开始处理视频: {url}")
 
     hints = [l["name"] for l in (catalog or [])][:60]
-    got, load_err = {"title": "", "transcript": "", "seen": {"text": [], "places": []}, "steps": [], "notes": []}, ""
+    got, load_err = {"title": "", "description": "", "page_text": "", "transcript": "", "seen": {"text": [], "places": []}, "steps": [], "notes": []}, ""
     try:
         got = VideoProcessor().understand(url, city, hints, step)
     except Exception as e:  # noqa: BLE001 — 网络 / 链接失效 / 抖音限制
@@ -108,7 +125,7 @@ def _process_single_video(url: str, index: int, total: int, mbti: str, share_tex
     screen = vision.as_text(got["seen"])
 
     step("识别地点")
-    text = "\n".join(t for t in (got["title"], _context_for(url, share_text), transcript, screen) if t)
+    text = "\n".join(t for t in (got["title"], got.get("description"), got.get("page_text"), _context_for(url, share_text), transcript, screen) if t)
     locations = extract_places(text, city, catalog or []) if text.strip() else []
     if locations:
         from backend.services.geo import fill_missing
@@ -116,6 +133,7 @@ def _process_single_video(url: str, index: int, total: int, mbti: str, share_tex
         fill_missing(locations, city)
         for loc in locations:
             loc["source"] = "video"
+    logger.info("[%d/%d] %.1fs → 结束，识别到 %d 个地点", index + 1, total, _time.time() - t0, len(locations))
     mode = "+".join(got["steps"]) or "share_text"
     info = {**base, "title": got["title"], "transcript": transcript or None, "screen": screen, "mode": mode, "notes": got["notes"], "done": [_STEP_LABEL[s] for s in got["steps"]]}
     if locations:
@@ -154,7 +172,7 @@ def _parse_request(data) -> tuple[dict | None, tuple | None]:
         return None, (jsonify({"error": f"一次最多分析 {MAX_VIDEO_URLS} 个视频"}), 400)
     bad = [u for u in urls if not is_allowed_video_url(u)]
     if bad:
-        return None, (jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）", "invalid": bad[:3]}), 400)
+        return None, (jsonify({"error": f"仅支持{VIDEO_PLATFORMS}的视频链接，其他网页链接请在「灵感素材」里直接粘贴", "invalid": bad[:3]}), 400)
     return {
         "urls": urls,
         "mbti": (data.get("personality") or {}).get("mbti", ""),
@@ -202,10 +220,8 @@ def _run_analysis(params: dict, on_progress=None) -> dict:
             unique.append(loc)
     logger.info(f"分析完成：{len(transcripts)}/{len(urls)} 个视频成功，提取 {len(unique)} 个景点")
 
-    # 有坐标的新地点存进该城市的景点库（下次识别、生成行程时可直接用）
-    from backend.services.catalog import upsert_places
-
-    upsert_places(city, [dict(l) for l in unique if l.get("lat") is not None and not str(l.get("id", "")).startswith("loc_")], category="视频推荐")
+    # 视频里识别出的地点只属于这次分析，不写进共享景点库：画面里路过的招牌、口误都可能被识别出来，
+    # 写进库会在之后所有人的识别和推荐里反复出现（联网搜索归纳的地点有多篇资料交叉印证，才会入库）
 
     from backend.services import asr
 
@@ -283,7 +299,7 @@ def transcribe_single():
     if not url:
         return jsonify({"error": "请提供视频链接"}), 400
     if not is_allowed_video_url(url):
-        return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）"}), 400
+        return jsonify({"error": f"仅支持{VIDEO_PLATFORMS}的视频链接"}), 400
     city = str(data.get("city") or "")[:20]
     try:
         got = VideoProcessor().understand(url, city, [l["name"] for l in _load_catalog(city)][:60] if city else [])
@@ -313,7 +329,8 @@ def _extract_locations_from_text(transcript: str, video_title: str, mbti: str, c
 
 ## 规则
 1. 地点名必须在标题或内容里原样出现（可以去掉「的」「这家」之类的修饰），是能真实前往的景点、街道、建筑、店铺、展馆、公园、码头等
-2. 不要输出：城市 / 行政区 / 区域泛称（{where}、市中心、附近）、交通和住宿泛称（地铁站、机场、酒店）、品类词（餐厅、咖啡店、景点、打卡点），以及内容没直接说出的推测地点
+2. 不要输出：城市 / 行政区 / 区域泛称（{where}、市中心、附近）、交通和住宿泛称（地铁站、机场、酒店）、品类词（餐厅、咖啡店、景点、打卡点）、
+   与游玩无关的地方（小区、物业、家政、银行、诊所），以及内容没直接说出的推测地点；同一个地方的中英文名只保留中文名
 3. 「A、B 漫步」要拆成 A 和 B；「某某三件套」只在内容明确说出各自名字时才拆
 4. reason：一句话概括内容里对这个地方说了什么（比如推荐的菜、拍照机位、注意事项），不要泛泛而谈
 
@@ -398,6 +415,11 @@ def _is_generic_location_name(name: str) -> bool:
     if len(normalized_name) <= 3 and normalized_name.endswith(_GENERIC_LOCATION_SUFFIXES):
         return True
     if any(word in normalized_name for word in ("附近", "周边", "旁边", "对面", "入口", "出口")):
+        return True
+    # 视频画面里常拍到的路边招牌：与游玩无关
+    if any(word in normalized_name for word in ("家政", "物业", "中介", "房产", "银行", "诊所", "药房", "小区", "快递", "加油站", "停车场", "营业厅", "公司")):
+        return True
+    if normalized_name.endswith(("苑", "家园", "新村", "公寓")):  # 住宅小区名
         return True
     if normalized_name.endswith(("站", "机场", "酒店", "民宿")) and normalized_name not in _SHANGHAI_COORD_FALLBACK:
         return True
@@ -710,77 +732,3 @@ def _infer_type_from_keywords(keywords: list) -> str:
     if any(w in text for w in ["馆", "院", "寺", "园", "庙", "博物馆", "故居", "文化"]):
         return "culture"
     return "landmark"
-
-
-def _save_locations_to_db(locations: list) -> int:
-    """
-    将视频提取的景点持久化到 attractions 表
-    使用 INSERT OR IGNORE 避免重复（UNIQUE name+city 约束）
-    返回实际新增的条数
-    """
-    from backend.database import get_db
-
-    if not locations:
-        return 0
-
-    db = get_db()
-    saved = 0
-    try:
-        for loc in locations:
-            name = (loc.get("name") or "").strip()
-            if not name:
-                continue
-
-            # 坐标补全：LLM 给了就用，没给就从兜底表查，再没有就用上海市中心
-            lat, lng = _fill_coords(name, loc.get("lat"), loc.get("lng"))
-            if lat is None or lng is None:
-                continue
-
-            keywords = loc.get("keywords", [])
-            # 优先用 LLM 给的 type，没有则从关键词推断
-            raw_type = (loc.get("type") or "").strip().lower()
-            if raw_type in ("landmark", "street", "food", "culture"):
-                loc_type = raw_type
-            else:
-                loc_type = _infer_type_from_keywords(keywords)
-
-            try:
-                cursor = db.execute(
-                    """INSERT OR IGNORE INTO attractions
-                       (name, city, type, category, description, address,
-                        lat, lng, tags, crowd_level, cost_level, duration_min,
-                        best_time, suitable_for, personality_fit, tips, risks)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        name,
-                        "上海",
-                        loc_type,
-                        "视频推荐",
-                        loc.get("reason", ""),
-                        "",
-                        lat,
-                        lng,
-                        json.dumps(keywords, ensure_ascii=False),
-                        "medium",
-                        "中等",
-                        60,
-                        "全天",
-                        json.dumps([], ensure_ascii=False),
-                        json.dumps(loc.get("travel_style_fit", {}), ensure_ascii=False),
-                        "",
-                        "",
-                    ),
-                )
-                if cursor.rowcount > 0:
-                    saved += 1
-            except Exception as e:
-                logger.warning(f"保存景点 [{name}] 失败: {e}")
-
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"批量保存景点失败: {e}")
-    finally:
-        db.close()
-
-    return saved

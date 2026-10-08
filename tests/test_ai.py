@@ -221,7 +221,7 @@ def test_video_job_reports_progress_and_uses_what_it_saw(client, auth, monkeypat
     result = state["result"]
     assert {l["name"] for l in result["locations"]} == {"武康路·武康大楼", "外滩夜景"}
     t = result["transcripts"][0]
-    assert t["done"] == ["读了标题", "看了画面"] and "40%" in t["notes"][0] and "武康路" in t["screen"]
+    assert t["done"] == ["读了标题和简介", "看了画面"] and "40%" in t["notes"][0] and "武康路" in t["screen"]
 
     # 别人的任务看不到
     other = client.post("/api/auth/guest").get_json()["token"]
@@ -260,3 +260,8 @@ def test_short_natural_landmarks_are_kept():
     text = "打算去杭州，西湖边走走，再去灵隐寺，晚上河坊街吃东西，路过附近的商场，第二天去乌镇，住在桐乡市"
     locs = [{"name": n, "type": "landmark"} for n in ("西湖", "灵隐寺", "河坊街", "商场", "附近", "乌镇", "桐乡市")]
     assert [l["name"] for l in _filter_extracted_locations(locs, text)] == ["西湖", "灵隐寺", "河坊街", "乌镇"]
+
+    # 视频画面里路过的招牌、住宅小区不算可去的地点
+    signs = "路过宏丰家政和元通欣苑，拐进芳华横街"
+    locs = [{"name": n, "type": "landmark"} for n in ("宏丰家政", "元通欣苑", "芳华横街")]
+    assert [l["name"] for l in _filter_extracted_locations(locs, signs)] == ["芳华横街"]

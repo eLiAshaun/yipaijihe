@@ -19,9 +19,12 @@ const host = (u) => {
     return u.slice(0, 24);
   }
 };
-const isDouyin = (u) => /(^|\.)(douyin|iesdouyin|amemv)\.com$/i.test(host(u));
+/** 视频平台：抖音走分享页解析，其他平台由后端的 yt-dlp 下载；其余链接当作文章，读正文 */
+const VIDEO_HOST = /(^|\.)(douyin\.com|iesdouyin\.com|amemv\.com|bilibili\.com|b23\.tv|youtube\.com|youtu\.be|xiaohongshu\.com|xhslink\.com|ixigua\.com)$/i;
+const isVideo = (u) => VIDEO_HOST.test(host(u));
+const MAX_ARTICLES = 5;
 /** 去掉链接后剩下的文字（小红书笔记、攻略、地名清单…） */
-const textOnly = (text) => text.replace(/https?:\/\/\S+/g, " ").replace(/\s+/g, " ").trim();
+const textOnly = (text) => text.replace(/https?:\/\/\S+/g, " ").replace(/[ \t]+/g, " ").replace(/ *\n[\s]*/g, "\n").trim(); // 保留换行：识别时按句引用原文
 const hasWords = (text) => (text.match(/[一-龥A-Za-z]/g) || []).length >= 2;
 
 const SOURCE = { video: ["film", "来自视频"], inspiration: ["file", "来自文字"] };
@@ -34,7 +37,9 @@ function capText(c) {
   if (asr.engine === "mimo") ear = "用 MiMo 听视频讲解";
   else if (asr.engine === "local" && asr.ready) ear = "用本地 Whisper 听视频讲解";
   const parts = [ear, eye].filter(Boolean);
-  let text = parts.length ? `抖音视频会下载下来，${parts.join("，并")}，再识别其中的地点。` : "抖音视频会读取标题和你粘贴的文案来识别地点。";
+  const platforms = (c.video_platforms || ["抖音"]).join(" / ");
+  let text = parts.length ? `视频链接（${platforms}）会下载下来，${parts.join("，并")}，再识别其中的地点。` : `视频链接（${platforms}）会读取标题和你粘贴的文案来识别地点。`;
+  if (c.reader) text = `${text}文章链接（公众号、知乎、马蜂窝、携程…）会读取正文。`;
   if (asr.engine === "local" && !asr.ready) {
     text += asr.state === "error" ? "（本地语音模型加载失败，暂时不听语音）" : `（本地语音模型正在后台准备${asr.progress != null ? ` ${asr.progress}%` : ""}，好了之后会自动开始听语音）`;
   } else if (asr.engine === "none" && c.vision) {
@@ -72,7 +77,7 @@ export default {
       class: "textarea video-ta",
       id: "f-links",
       rows: 6,
-      placeholder: "粘贴任何旅行灵感：\n· 抖音分享链接 / 整段分享文案\n· 小红书笔记、公众号攻略、朋友发的清单\n例如：早上去武康大楼拍照，下午安福路喝咖啡，晚上外滩看夜景",
+      placeholder: "粘贴任何旅行灵感：\n· 抖音 / B 站 / 小红书 / YouTube 链接或整段分享文案\n· 公众号、知乎、马蜂窝攻略链接，朋友发的清单\n例如：早上去武康大楼拍照，下午安福路喝咖啡，晚上外滩看夜景",
       "aria-label": "旅行灵感素材",
       value: state.videoLinks.join("\n"),
     });
@@ -87,7 +92,7 @@ export default {
       const urls = extractUrls(ta.value);
       const words = textOnly(ta.value);
       const parts = [];
-      if (urls.length) parts.push(h("span", { class: "faint", style: { fontSize: "var(--fs-sm)" } }, `${urls.length} 条链接：`), urls.map((u) => h("span", { class: ["chip", !isDouyin(u) && "chip--muted"], title: isDouyin(u) ? "" : "非抖音链接无法读取内容，会只分析你粘贴的文字" }, icon("link"), host(u))));
+      if (urls.length) parts.push(h("span", { class: "faint", style: { fontSize: "var(--fs-sm)" } }, `${urls.length} 条链接：`), urls.map((u) => h("span", { class: "chip", title: isVideo(u) ? "视频：听讲解、看画面" : "文章：读取正文" }, icon(isVideo(u) ? "film" : "file"), host(u))));
       if (hasWords(words)) parts.push(h("span", { class: "chip" }, icon("file"), `${words.length} 字文字`));
       mountInto(chips, parts.length ? parts : h("span", { class: "hint" }, "还没有内容"));
     };
@@ -103,10 +108,10 @@ export default {
       const raw = ta.value.trim();
       if (!raw) return toast("先粘贴一些内容：抖音链接、笔记或地名都行", { error: true });
       const urls = extractUrls(raw);
-      const douyin = urls.filter(isDouyin).slice(0, 10);
+      const douyin = urls.filter(isVideo).slice(0, 10);
       const words = textOnly(raw);
-      const others = urls.filter((u) => !isDouyin(u));
-      if (!douyin.length && !hasWords(words)) return toast("没有可分析的内容：小红书等链接无法直接读取，请把笔记文字一起粘贴进来", { error: true });
+      const articles = urls.filter((u) => !isVideo(u)).slice(0, MAX_ARTICLES);
+      if (!douyin.length && !articles.length && !hasWords(words)) return toast("没有可分析的内容：粘贴视频 / 文章链接，或者带地名的文字", { error: true });
 
       state.videoLinks = raw.split("\n");
       analyzeBtn.disabled = true;
@@ -115,8 +120,9 @@ export default {
       const bar = h("div", { class: "progress" }, h("i"));
       const label = h("p", { class: "analysis-label" });
       const rows = h("ol", { class: "video-rows" }, douyin.map((u) => h("li", null, h("span", { class: "stage-dot" }), h("code", null, host(u)), h("span", { class: "video-stage" }, "排队中"))));
-      const textRow = hasWords(words) ? h("p", { class: "analysis-label" }, icon("file"), ` 正在识别 ${words.length} 字文字里的地点…`) : null;
-      const head = [douyin.length && `${douyin.length} 个抖音视频`, hasWords(words) && `${words.length} 字文字`].filter(Boolean).join(" + ");
+      const readText = hasWords(words) || articles.length;
+      const textRow = readText ? h("p", { class: "analysis-label" }, icon("file"), articles.length ? ` 正在读取 ${articles.length} 篇文章并识别地点…` : ` 正在识别 ${words.length} 字文字里的地点…`) : null;
+      const head = [douyin.length && `${douyin.length} 个视频`, articles.length && `${articles.length} 篇文章`, hasWords(words) && `${words.length} 字文字`].filter(Boolean).join(" + ");
       const slow = douyin.length && (caps.asr || caps.vision);
       mountInto(stage, h("div", { class: "analysis-top" }, h("b", null, `正在分析 ${head}`), h("span", { class: "mono faint" }, slow ? "每个视频约 0.5–2 分钟" : "几秒钟")), bar, douyin.length ? rows : null, textRow, label);
       stage.hidden = false;
@@ -130,13 +136,19 @@ export default {
         label.textContent = `已用 ${Math.round((Date.now() - t0) / 1000)} 秒`;
       }, 700);
       const onItems = (items) => {
-        const total = items.reduce((n, it) => n + (STAGE_STEP[it.stage] ?? 1), 0);
+        // 「听语音 45%」这类带百分比的阶段：按名称取进度，并把百分比折算进去
+        const stepOf = (stage) => {
+          const [name, pct] = stage.split(" ");
+          return (STAGE_STEP[name] ?? 1) + (pct ? parseInt(pct, 10) / 100 : 0);
+        };
+        const total = items.reduce((n, it) => n + stepOf(it.stage), 0);
         pct = Math.max(pct, Math.min(96, Math.round((total / (6 * items.length)) * 100)));
         items.forEach((it, i) => {
           const li = rows.children[i];
           if (!li) return;
           li.querySelector(".video-stage").textContent = it.stage;
-          li.className = STAGE_STEP[it.stage] >= 6 ? "done" : STAGE_STEP[it.stage] > 0 ? "on" : "";
+          const n = stepOf(it.stage);
+          li.className = n >= 6 ? "done" : n > 0 ? "on" : "";
         });
       };
 
@@ -144,7 +156,7 @@ export default {
       const city = state.trip.city;
       const jobs = [];
       if (douyin.length) jobs.push(runVideoJob({ urls: douyin, text: raw, city, personality: p ? { mbti: p.mbti, personality_name: p.personality?.name } : {} }, onItems, ctx.alive).then((d) => ({ kind: "video", d })));
-      if (hasWords(words)) jobs.push(api.post("/api/inspiration/extract", { text: words, city }).then((d) => ((textRow && (textRow.textContent = `✓ 文字里找到 ${d.count} 个地点`)), { kind: "text", d })));
+      if (readText) jobs.push(api.post("/api/inspiration/extract", { text: hasWords(words) ? words : "", urls: articles, city }).then((d) => ((textRow && (textRow.textContent = `✓ ${articles.length ? "文章和文字" : "文字"}里找到 ${d.count} 个地点`)), { kind: "text", d })));
 
       try {
         const settled = await Promise.allSettled(jobs);
@@ -162,7 +174,7 @@ export default {
           seen.add(l.name);
           merged.push({ ...l, id: l.id || `insp_${i + 1}`, keywords: l.keywords || l.tags || [], reason: l.reason || "" });
         });
-        state.videoAnalysis = { errors: video?.errors || [], transcripts: video?.transcripts || [], others, asr: !!video?.asr, vision: !!video?.vision, count: merged.length };
+        state.videoAnalysis = { errors: video?.errors || [], transcripts: video?.transcripts || [], links: text?.links || [], asr: !!video?.asr, vision: !!video?.vision, count: merged.length };
         state.places = merged;
         state.selectedIds = new Set(merged.filter((l) => l.lat && l.lng).map((l) => l.id));
         persistDraft();
@@ -193,7 +205,9 @@ export default {
       };
       mountInto(
         results,
-        data.others?.length ? h("div", { class: "banner banner--info" }, icon("info"), `${data.others.length} 条非抖音链接（${data.others.map(host).slice(0, 2).join("、")}）无法直接读取，已分析你粘贴的文字`) : null,
+        data.links?.length ? h("div", { class: "video-done" }, data.links.map((l) => h("div", { class: ["video-heard", "link-read", !l.ok && "is-failed"] },
+          icon(l.ok ? "file" : "alert"), h("b", null, l.ok ? `《${(l.title || host(l.url)).slice(0, 30)}》` : host(l.url)),
+          h("span", { class: "faint" }, l.ok ? ` 读了正文 ${l.chars} 字` : ` 没读到正文（${l.error || "需要登录"}），已用你粘贴的文字`)))) : null,
         data.transcripts?.length ? h("div", { class: "video-done" }, data.transcripts.map((t) => h("details", { class: "video-heard" },
           h("summary", null, icon("film"), h("b", null, t.title ? `「${t.title.slice(0, 28)}」` : host(t.url)), h("span", { class: "faint" }, ` ${(t.done || []).join(" · ") || "读了你粘贴的文案"}`)),
           (t.notes || []).map((n) => h("p", { class: "hint" }, n)),

@@ -61,6 +61,13 @@ class Config:
     LLM_TIMEOUT = _float_env("LLM_TIMEOUT", 60)
     LLM_MAX_RETRIES = _int_env("LLM_MAX_RETRIES", 1)
 
+    # 互联网渠道（选型参照 Agent Reach）：Exa 语义搜索、Jina Reader 读网页、yt-dlp 下载视频。都免 Key，填 Key 可提高额度
+    EXA_MCP_URL = os.getenv("EXA_MCP_URL", "https://mcp.exa.ai/mcp").strip()
+    EXA_API_KEY = _secret("EXA_API_KEY")
+    JINA_API_KEY = _secret("JINA_API_KEY")
+    # B 站 / YouTube 风控时可提供 Netscape 格式的 cookies.txt（浏览器插件导出）
+    YTDLP_COOKIES = os.getenv("YTDLP_COOKIES", "").strip()
+
     # 语音转写（听抖音视频里的讲解）
     #   auto  = 配了 MIMO_API_KEY 用 MiMo 云端转写，否则用本地 Whisper（免费，需安装 requirements-video.txt）
     #   local / mimo / off
@@ -112,3 +119,7 @@ class Config:
     HAS_MIMO_ASR = bool(MIMO_API_KEY) and ASR_ENGINE in ("auto", "mimo")
     HAS_LOCAL_ASR = ASR_ENGINE in ("auto", "local") and importlib.util.find_spec("faster_whisper") is not None
     HAS_ASR = HAS_MIMO_ASR or HAS_LOCAL_ASR
+    # yt-dlp（requirements-video.txt）装上即可下载 B 站 / YouTube / 小红书等平台的视频；YTDLP=off 关闭
+    HAS_YTDLP = os.getenv("YTDLP", "auto").strip().lower() != "off" and importlib.util.find_spec("yt_dlp") is not None
+    # 读网页（Jina Reader / Exa）：灵感素材里的文章链接、联网搜索时读攻略全文；WEB_READER=off 关闭
+    HAS_READER = os.getenv("WEB_READER", "auto").strip().lower() != "off"

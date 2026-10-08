@@ -2,9 +2,10 @@
 联网搜索：这里负责「搜」，再交给大模型「读」。
 
 DeepSeek 等模型的 API 不带联网搜索工具（web_search 类型的工具会被忽略），所以：
-  1. 多个搜索源并行查询（头条搜索 / Bing / DuckDuckGo），丢掉和查询无关的结果
+  1. 多个搜索源并行查询（Exa 语义搜索 / 头条搜索 / Bing / DuckDuckGo），丢掉和查询无关的结果
      —— Bing 对疑似程序的请求有时会返回随机热门结果，必须做相关性过滤
-  2. 把「标题 + 摘要（+ 少量能直接读取的正文）」编号后交给大模型，只允许它根据这些资料回答，并注明引用编号
+  2. 再读几篇攻略全文（Jina Reader，连头条这类要执行 JS 的页面也能读），
+     把「标题 + 正文 / 摘要」编号后交给大模型，只允许它根据这些资料回答，并注明引用编号
   3. 地点坐标用地理编码校正（Photon → GCJ-02），不直接相信模型给的经纬度
 
 discover_attractions 的后备链：
@@ -21,7 +22,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.parse import quote, urlparse
 
 import requests
@@ -101,7 +102,14 @@ def _duckduckgo(query: str) -> list[dict]:
     return out
 
 
-_ENGINES = (_toutiao, _bing, _duckduckgo)
+def _exa(query: str) -> list[dict]:
+    """Exa 语义搜索（Agent Reach 的「全网语义搜索」渠道）：结果自带正文摘录"""
+    from backend.services.reach import exa_search
+
+    return exa_search(query, 8)
+
+
+_ENGINES = (_exa, _toutiao, _bing, _duckduckgo)
 
 
 def _bigrams(text: str) -> set[str]:
@@ -166,10 +174,24 @@ def _public_http(url: str) -> bool:
 
 
 def fetch_text(url: str, limit: int = 2500, focus: str = "") -> str:
-    """读取网页正文（只读服务端渲染的页面）；失败返回空串"""
+    """读取网页正文；失败返回空串。服务端渲染的页面直接读，要执行 JS 的（头条、知乎…）或直接读失败的交给 Jina Reader"""
     host = (urlparse(url).hostname or "").lower()
-    if not _public_http(url) or any(host == h or host.endswith("." + h) for h in _JS_ONLY_HOSTS):
+    if not _public_http(url):
         return ""
+    text = ""
+    if not any(host == h or host.endswith("." + h) for h in _JS_ONLY_HOSTS):
+        text = _fetch_direct(url)
+    if not text:
+        from backend.services.reach import read_url
+
+        text = read_url(url, limit=limit * 2, timeout=8, fallback=False)["text"]
+    if focus and focus in text:
+        start = max(0, text.find(focus) - 200)
+        text = text[start:]
+    return text[:limit]
+
+
+def _fetch_direct(url: str) -> str:
     try:
         with requests.get(url, headers=_HEADERS, timeout=6, stream=True, allow_redirects=True) as resp:
             if resp.status_code != 200 or "html" not in resp.headers.get("Content-Type", "html"):
@@ -181,19 +203,15 @@ def fetch_text(url: str, limit: int = 2500, focus: str = "") -> str:
     page = raw.decode(encoding or "utf-8", "replace")
     page = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", page)
     text = _clean(re.sub(r"(?i)<(br|p|div|li|h\d)[^>]*>", "\n", page))
-    if len(re.findall(r"[一-龥]", text)) < 200:
-        return ""
-    if focus and focus in text:
-        start = max(0, text.find(focus) - 200)
-        text = text[start:]
-    return text[:limit]
+    return text if len(re.findall(r"[\u4e00-\u9fa5]", text)) >= 200 else ""
 
 
-def format_sources(items: list[dict], start: int = 1) -> str:
+def format_sources(items: list[dict], start: int = 1, max_chars: int = 2500) -> str:
     lines = []
     for i, it in enumerate(items, start):
-        body = it.get("content") or it["snippet"]
-        lines.append(f"[{i}] {it['title']}（{it['engine']}）\n{body}")
+        body = (it.get("content") or it["snippet"])[:max_chars]
+        date = f"，{it['published']}" if it.get("published") else ""
+        lines.append(f"[{i}] {it['title']}（{it['engine']}{date}）\n{body}")
     return "\n\n".join(lines)
 
 
@@ -242,11 +260,14 @@ def _gather_sources(city: str, days: int, profile: dict) -> list[dict]:
                     items.append(it)
         except Exception:  # noqa: BLE001
             continue
-    # 再读几篇能直接打开的攻略正文，摘要往往只有一两个地点
-    readable = [it for it in items if it["engine"] != "头条搜索"][:4]
-    for it, text in zip(readable, _IO_POOL.map(lambda x: fetch_text(x["url"], 2500, city), readable)):
-        if text:
-            it["content"] = text
+    # 摘要往往只提到一两个地点：再读几篇攻略全文（Exa 的结果已经带正文，不用再读）
+    # 总共最多等 10 秒，读得慢的那几篇就只用摘要，不拖慢整体
+    readable = [it for it in items if not it.get("content")][:5]
+    futures = {_IO_POOL.submit(fetch_text, it["url"], 3000, city): it for it in readable}
+    done, _ = wait(futures, timeout=10)
+    for fut in done:
+        if not fut.exception() and fut.result():
+            futures[fut]["content"] = fut.result()
     return items[:24]
 
 
@@ -432,4 +453,4 @@ def answer_sources(query: str, city: str = "", limit: int = 6) -> tuple[str, lis
     """给对话用：搜索并返回（编号资料文本, 资料列表）"""
     must = (city,) if city and city in query else ()
     items = search(query, limit=limit, must=must)
-    return format_sources(items), [{"title": it["title"], "url": it["url"], "engine": it["engine"]} for it in items]
+    return format_sources(items, max_chars=900), [{"title": it["title"], "url": it["url"], "engine": it["engine"]} for it in items]

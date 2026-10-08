@@ -1,3 +1,8 @@
+> **这是项目早期的本地脚本，网站已经不再依赖它。**
+> 现在网站按 [Agent Reach](https://github.com/Panniantong/agent-reach) 的选型直接调用上游工具：
+> Exa 语义搜索、Jina Reader 读网页、yt-dlp 下载视频（见 `backend/services/reach.py` 和根目录 README 的「互联网渠道」一节）。
+> 想给自己的 AI 助手安装 Agent Reach，请按官方说明：https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md
+
 # Agent Reach — 本地互联网接入
 
 给 AI Agent 接入抖音、小红书等平台的能力。

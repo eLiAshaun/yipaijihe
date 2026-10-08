@@ -28,7 +28,7 @@ if errorlevel 1 (
 
 rem 视频分析组件（本地语音转写 + 截取画面）：可选，装不上不影响其他功能
 if not "%SKIP_VIDEO_DEPS%"=="1" (
-  ".venv\Scripts\python.exe" -c "import faster_whisper, av, PIL" 2>nul
+  ".venv\Scripts\python.exe" -c "import faster_whisper, av, PIL, yt_dlp" 2>nul
   if errorlevel 1 (
     echo 正在安装视频分析组件（本地语音转写，约 100MB，只需一次）...
     %PIP% -r requirements-video.txt || %PIP% %MIRROR% -r requirements-video.txt || echo 视频分析组件没装上，将跳过「听语音」，其他功能不受影响

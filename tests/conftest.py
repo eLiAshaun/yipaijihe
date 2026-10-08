@@ -15,6 +15,8 @@ for _k in ("LLM_API_KEY", "DEEPSEEK_API_KEY", "DOUBAO_API_KEY", "MIMO_API_KEY"):
     os.environ[_k] = ""
 os.environ["ASR_ENGINE"] = "off"
 os.environ["WEB_SEARCH"] = "off"
+os.environ["WEB_READER"] = "off"
+os.environ["YTDLP"] = "off"
 
 
 @pytest.fixture(scope="session")

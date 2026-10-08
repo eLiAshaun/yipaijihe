@@ -177,3 +177,6 @@
 .video-heard summary { display: flex; align-items: center; gap: 8px; cursor: pointer; flex-wrap: wrap; }
 .video-heard summary svg { width: 16px; height: 16px; color: var(--seal); flex: none; }
 .video-heard p { margin-top: 8px; color: var(--ink-2); line-height: 1.7; }
+.link-read { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.link-read svg { width: 16px; height: 16px; color: var(--sea); flex: none; }
+.link-read.is-failed svg { color: var(--sun); }
