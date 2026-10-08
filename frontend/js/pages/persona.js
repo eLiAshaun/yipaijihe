@@ -2,7 +2,7 @@ import { h, mountInto, clamp, copyText } from "../core/dom.js";
 import { icon } from "../core/icons.js";
 import { api } from "../core/api.js";
 import { state } from "../core/state.js";
-import { personaImg, decoFromFile } from "../core/config.js";
+import { personaImg, personaThumb, decoFromFile } from "../core/config.js";
 import { savePersona } from "../services/auth.js";
 import { toast, toastError } from "../ui/toast.js";
 
@@ -169,6 +169,42 @@ export default {
       return a !== undefined && a !== null && (!Array.isArray(a) || a.length > 0);
     };
 
+    /** 不想答题：直接从 6 种人格里选一个 */
+    async function showPicker() {
+      mountInto(page, h("div", { class: "skeleton", style: { height: "420px" } }));
+      let personas = [];
+      try {
+        personas = (await api.get("/api/mbti/personas", { signal: ctx.signal })).personas;
+      } catch (e) {
+        if (ctx.alive()) toastError(e);
+        return ctx.alive() && startQuiz();
+      }
+      if (!ctx.alive()) return;
+      mountInto(
+        page,
+        h("div", { class: "page-head page-head--center" }, h("p", { class: "eyebrow" }, "STEP 01 · 直接选择"), h("h1", null, "你是哪一种", h("span", { class: "mark" }, "旅行者"), "？"), h("p", null, "选一个最像你的。之后随时可以在右上角重新测试。")),
+        h("div", { class: "picker" }, personas.map((pp, i) =>
+          h("button", { class: "pick rise", type: "button", style: { "--i": i }, onclick: async (e) => {
+            e.currentTarget.classList.add("is-loading");
+            try {
+              const result = await api.post("/api/mbti/pick", { code: pp.code });
+              await savePersona(result);
+              if (ctx.alive()) showResult(result, { fresh: true });
+            } catch (ex) {
+              toastError(ex);
+            }
+          } },
+            h("img", { src: personaThumb(pp.image), alt: "", width: 480, height: 480, loading: "lazy" }),
+            h("span", { class: "pick-body" },
+              h("b", null, `${pp.emoji} ${pp.name}`),
+              h("small", { class: "mono" }, pp.code),
+              h("span", { class: "muted" }, pp.full_name),
+              h("span", { class: "chip-row" }, (pp.style_tags || []).slice(0, 3).map((t) => h("span", { class: "tag" }, t))))
+          ))),
+        h("div", { class: "page-foot" }, h("button", { class: "btn btn--quiet", type: "button", onclick: startQuiz }, icon("arrow-left"), "还是答题测一测（约 2 分钟）"))
+      );
+    }
+
     async function startQuiz() {
       mountInto(page, h("div", { class: "skeleton", style: { height: "420px" } }));
       try {
@@ -209,7 +245,7 @@ export default {
 
       mountInto(
         page,
-        h("div", { class: "page-head page-head--center" }, h("p", { class: "eyebrow" }, "STEP 01 · 旅行人格"), h("h1", null, "先聊聊你的", h("span", { class: "mark" }, "旅行风格")), h("p", null, "旅行人格相对稳定，一次测试，之后每次规划都会用到。")),
+        h("div", { class: "page-head page-head--center" }, h("p", { class: "eyebrow" }, "STEP 01 · 旅行人格"), h("h1", null, "先聊聊你的", h("span", { class: "mark" }, "旅行风格")), h("p", null, "8 道题，约 2 分钟。旅行人格相对稳定，测一次，之后每次规划都会用到。"), h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: showPicker }, "我知道自己是哪种，直接选", icon("arrow-right", "i-arrow"))),
         progress,
         h(
           "div",

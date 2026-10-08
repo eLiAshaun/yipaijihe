@@ -97,6 +97,29 @@ _WEATHER_CACHE = {}
 _WEATHER_TTL = 30 * 60
 
 
+_GEO_CACHE = {}
+
+
+def _geocode(city: str):
+    """城市名 → 坐标（Open-Meteo 地理编码，免 Key）。用于没有内置景点库的城市查天气。"""
+    if city in _GEO_CACHE:
+        return _GEO_CACHE[city]
+    try:
+        resp = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1, "language": "zh", "format": "json"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        hit = (resp.json().get("results") or [None])[0]
+        coords = (hit["latitude"], hit["longitude"]) if hit else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("城市地理编码失败: %s", e)
+        return None
+    _GEO_CACHE[city] = coords
+    return coords
+
+
 @weather_bp.get("")
 def weather():
     """
@@ -124,7 +147,8 @@ def weather():
         row = db.execute("SELECT center_lat, center_lng FROM cities WHERE name = ?", (city,)).fetchone()
     finally:
         db.close()
-    if not row:
+    coords = (row["center_lat"], row["center_lng"]) if row else _geocode(city)
+    if not coords:
         return jsonify({"available": False, "reason": "unknown_city", "days": []})
 
     key = (city, start_d.isoformat(), days)
@@ -136,8 +160,8 @@ def weather():
         resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": row["center_lat"],
-                "longitude": row["center_lng"],
+                "latitude": coords[0],
+                "longitude": coords[1],
                 "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
                 "timezone": "Asia/Shanghai",
                 "start_date": max(start_d, today).isoformat(),

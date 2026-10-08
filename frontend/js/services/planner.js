@@ -110,17 +110,82 @@ export function paceFromPersona(persona) {
   return "balanced";
 }
 
+// ------------------------------------------------------------ 景点洞察 ----
+const WEEKDAY_CN = "一二三四五六日";
+const WINDOW_WORDS = [
+  ["清晨", [7 * 60, 10 * 60]],
+  ["早上", [7 * 60, 10 * 60]],
+  ["上午", [8 * 60 + 30, 12 * 60]],
+  ["中午", [11 * 60, 14 * 60]],
+  ["下午", [13 * 60, 17 * 60 + 30]],
+  ["傍晚", [17 * 60, 19 * 60 + 30]],
+  ["日落", [17 * 60, 19 * 60 + 30]],
+  ["夜间", [19 * 60, 22 * 60]],
+  ["夜晚", [19 * 60, 22 * 60]],
+  ["晚上", [19 * 60, 22 * 60]],
+];
+const insightCache = new WeakMap();
+
+/**
+ * 从景点的「建议时段 / 贴士 / 风险」文字里解析结构化信息（与后端 planner.insights 规则一致）：
+ *  closedWeekdays  0=周一 … 6=周日
+ *  needsBooking    需预约 / 订位
+ *  lastTime        末班时间（分钟）
+ *  window          建议时段 [开始, 结束]（分钟）
+ *  weekdayOnly     建议工作日前往
+ */
+export function insights(loc) {
+  if (!loc || typeof loc !== "object") return { closedWeekdays: [], needsBooking: false, lastTime: null, window: null, weekdayOnly: false };
+  if (insightCache.has(loc)) return insightCache.get(loc);
+  const text = ["tips", "risks", "best_time", "description"].map((k) => loc[k] || "").join(" ");
+  const closed = new Set();
+  for (const m of text.matchAll(/周([一二三四五六日天])[^，。；,;]{0,6}?(闭馆|休息|休馆|不开放|关闭|闭园)/g)) closed.add(WEEKDAY_CN.indexOf(m[1].replace("天", "日")));
+  const needsBooking = /(?<!无需|不需|不用)(预约|订位|提前订|需购票)/.test(text);
+  const last = /末班[^0-9]{0,4}(\d{1,2})[:：](\d{2})/.exec(text);
+  const best = String(loc.best_time || "");
+  const spans = WINDOW_WORDS.filter(([w]) => best.includes(w)).map(([, span]) => span);
+  const out = {
+    closedWeekdays: [...closed].sort(),
+    needsBooking,
+    lastTime: last ? Number(last[1]) * 60 + Number(last[2]) : null,
+    window: spans.length && !best.includes("全天") ? [Math.min(...spans.map((x) => x[0])), Math.max(...spans.map((x) => x[1]))] : null,
+    weekdayOnly: best.includes("工作日"),
+  };
+  insightCache.set(loc, out);
+  return out;
+}
+
+/** 预留的用餐时段（没有具体餐厅，由行程引擎插入或用户添加） */
+export const isMeal = (stop) => stop?.kind === "meal";
+
+export function mealBlock(kind = "lunch") {
+  const label = kind === "lunch" ? "午餐" : "晚餐";
+  return { time: "", kind: "meal", activity: label, notes: "预留 1 小时用餐，在附近找家店", location: { name: `${label} · 附近觅食`, type: "food", duration_min: 60 } };
+}
+
+const windowRank = (stop) => {
+  const w = isMeal(stop) ? null : insights(stopLocation(stop)).window;
+  if (!w) return 1;
+  return w[0] < 11 * 60 ? 0 : w[0] >= 17 * 60 ? 3 : w[0] >= 13 * 60 ? 2 : 1;
+};
+
 // ---------------------------------------------------------------- 一天 ----
-/** 每一段（含时间与通勤）的展开视图，用于渲染与校验 */
+/**
+ * 每一段（含时间与通勤）的展开视图，用于渲染与校验。
+ * 用餐时段没有坐标：到它的通勤记为 0（就近吃），它之后的一站从「上一个有坐标的地点」算通勤。
+ */
 export function daySegments(day) {
   const items = (day?.items || []).filter(Boolean);
+  let lastGeo = null;
   return items.map((stop, i) => {
     const start = toMin(stop.time);
     const dur = stopDuration(stop);
     const prev = items[i - 1];
-    const travel = prev ? estimateTravel(stopLocation(prev), stopLocation(stop)) : null;
+    let travel = null;
+    if (prev) travel = isMeal(stop) ? { meters: 0, minutes: 0, mode: "walk", virtual: true } : estimateTravel(lastGeo || stopLocation(prev), stopLocation(stop));
     const prevEnd = prev ? stopEnd(prev) : null;
     const slack = travel && prevEnd != null && start != null ? start - prevEnd - travel.minutes : null;
+    if (hasCoords(stopLocation(stop))) lastGeo = stopLocation(stop);
     return { stop, index: i, start, end: start == null ? null : start + dur, duration: dur, travel, slack };
   });
 }
@@ -133,59 +198,64 @@ export function dayStats(day) {
   const visitMin = segs.reduce((n, s) => n + s.duration, 0);
   const start = timed.length ? Math.min(...timed.map((s) => s.start)) : null;
   const end = timed.length ? Math.max(...timed.map((s) => s.end)) : null;
-  return { count: segs.length, visitMin, travelMin, meters, start, end, spanMin: start == null ? 0 : end - start };
+  return { count: segs.filter((s) => !isMeal(s.stop)).length, visitMin, travelMin, meters, start, end, spanMin: start == null ? 0 : end - start };
 }
 
 /**
  * 可行性检查：
  *  time-conflict  上一站结束 + 通勤 > 下一站开始
+ *  closed         这天不开放（需要出发日期）
+ *  last-time      超过末班时间
  *  overload       景点数超过节奏建议
  *  too-late       结束时间晚于 22:30
  *  too-long       一天跨度超过上限
  *  long-hop       相邻两点 > 12km
- *  no-meal        白天没有安排任何餐饮
+ *  no-meal        跨过饭点却没有餐饮
+ *  booking        需要提前预约 / 订位
+ *  best-time      和建议时段差得较远
+ *  weekend        建议工作日去，却排在周末
  *  no-coords      缺少坐标，无法估算通勤 / 上图
  */
-export function dayWarnings(day, paceKey = "balanced") {
+export function dayWarnings(day, paceKey = "balanced", { date = null } = {}) {
   const pace = PACES[paceKey] || PACES.balanced;
   const segs = daySegments(day);
   const out = [];
   const stats = dayStats(day);
+  const wd = date ? (date.getDay() + 6) % 7 : null; // 0=周一
 
   segs.forEach((s) => {
-    if (s.slack != null && s.slack < -5) {
-      out.push({
-        level: "warn",
-        code: "time-conflict",
-        stopId: s.stop.__stopId,
-        message: `「${stopName(s.stop)}」赶不上：上一站结束后通勤约需 ${s.travel.minutes} 分钟，还差 ${Math.abs(Math.round(s.slack))} 分钟`,
-      });
+    const id = s.stop.__stopId;
+    const name = stopName(s.stop);
+    if (s.slack != null && s.slack < -5 && !s.travel?.virtual) {
+      out.push({ level: "warn", code: "time-conflict", stopId: id, message: `「${name}」赶不上：上一站结束后通勤约需 ${s.travel.minutes} 分钟，还差 ${Math.abs(Math.round(s.slack))} 分钟` });
+    } else if (s.slack != null && s.slack < -5) {
+      out.push({ level: "warn", code: "time-conflict", stopId: id, message: `「${name}」和上一站时间重叠了 ${Math.abs(Math.round(s.slack))} 分钟` });
     }
+    if (isMeal(s.stop)) return;
+    const info = insights(stopLocation(s.stop));
+    if (wd != null && info.closedWeekdays.includes(wd)) {
+      out.push({ level: "warn", code: "closed", stopId: id, message: `「${name}」周${WEEKDAY_CN[wd]}不开放，换一天或换个地方` });
+    }
+    if (info.lastTime != null && s.end != null && s.end > info.lastTime) {
+      out.push({ level: "warn", code: "last-time", stopId: id, message: `「${name}」末班约 ${fromMin(info.lastTime)}，按现在的安排赶不上` });
+    }
+    if (info.needsBooking) out.push({ level: "info", code: "booking", stopId: id, message: `「${name}」需要提前预约 / 订位` });
+    if (info.window && s.start != null && (s.start < info.window[0] - 60 || s.start > info.window[1])) {
+      out.push({ level: "info", code: "best-time", stopId: id, message: `「${name}」建议${stopLocation(s.stop).best_time}去，现在排在 ${fromMin(s.start)}` });
+    }
+    if (info.weekdayOnly && wd != null && wd >= 5) out.push({ level: "info", code: "weekend", stopId: id, message: `「${name}」建议工作日去，周末可能部分不开放或人多` });
     if (s.travel && s.travel.meters > 12000) {
-      out.push({
-        level: "info",
-        code: "long-hop",
-        stopId: s.stop.__stopId,
-        message: `到「${stopName(s.stop)}」距离较远（约 ${(s.travel.meters / 1000).toFixed(1)} km），建议打车或调整顺序`,
-      });
+      out.push({ level: "info", code: "long-hop", stopId: id, message: `到「${name}」距离较远（约 ${(s.travel.meters / 1000).toFixed(1)} km），建议打车或调整顺序` });
     }
-    if (!hasCoords(stopLocation(s.stop))) {
-      out.push({ level: "info", code: "no-coords", stopId: s.stop.__stopId, message: `「${stopName(s.stop)}」没有坐标，无法估算通勤` });
-    }
+    if (!hasCoords(stopLocation(s.stop))) out.push({ level: "info", code: "no-coords", stopId: id, message: `「${name}」没有坐标，无法估算通勤` });
   });
 
-  if (stats.count > pace.maxStops) {
-    out.push({ level: "warn", code: "overload", message: `今天安排了 ${stats.count} 个点，超过「${pace.label}」节奏建议的 ${pace.maxStops} 个` });
-  }
-  if (stats.end != null && stats.end > 22.5 * 60) {
-    out.push({ level: "warn", code: "too-late", message: `预计 ${fromMin(stats.end)} 才结束，太晚了` });
-  }
-  if (stats.spanMin > pace.maxSpanH * 60) {
-    out.push({ level: "warn", code: "too-long", message: `全天跨度约 ${(stats.spanMin / 60).toFixed(1)} 小时，容易疲劳` });
-  }
-  if (stats.count >= 3) {
-    const hasMeal = segs.some((s) => stopLocation(s.stop).type === "food");
-    if (!hasMeal) out.push({ level: "info", code: "no-meal", message: "这天还没有安排餐饮，可以从推荐里加一家" });
+  if (stats.count > pace.maxStops) out.push({ level: "warn", code: "overload", message: `今天安排了 ${stats.count} 个点，超过「${pace.label}」节奏建议的 ${pace.maxStops} 个` });
+  if (stats.end != null && stats.end > 22.5 * 60) out.push({ level: "warn", code: "too-late", message: `预计 ${fromMin(stats.end)} 才结束，太晚了` });
+  if (stats.spanMin > pace.maxSpanH * 60) out.push({ level: "warn", code: "too-long", message: `全天跨度约 ${(stats.spanMin / 60).toFixed(1)} 小时，容易疲劳` });
+  const coversLunch = stats.start != null && stats.start <= MEAL.lunch[0] + 30 && stats.end >= MEAL.lunch[1];
+  if (coversLunch && !segs.some((s) => isMeal(s.stop) || stopLocation(s.stop).type === "food")) {
+    out.push({ level: "info", code: "no-meal", message: "这天跨过了饭点却没有安排吃饭，可以点「添加景点」或从推荐里加一家" });
   }
   return out;
 }
@@ -194,34 +264,56 @@ export function dayWarnings(day, paceKey = "balanced") {
 const MEAL = { lunch: [11 * 60 + 30, 13 * 60 + 30], dinner: [17 * 60 + 30, 19 * 60 + 30] };
 
 /**
- * 按当前顺序重新排布一天的时间：
- *  开始时间 → 依次 “停留 + 通勤” → 餐饮点落在饭点窗口。
+ * 按当前顺序重新排布一天的时间（与后端 planner.schedule 规则一致）：
+ *  · 逐站「停留 + 通勤」，15 分钟取整
+ *  · 锁定时间的景点（订好的餐厅 / 门票）原样保留
+ *  · 有建议时段的景点在合理等待范围内等到时段开始（傍晚 / 夜间、最后一站可多等）
+ *  · 用餐时段与餐饮点落在饭点窗口
  * 返回新的 day（不修改入参）。
  */
 export function reflowDay(day, { startTime = "09:00" } = {}) {
   const items = (day.items || []).filter(Boolean).map((s) => ({ ...s }));
   let cursor = toMin(startTime) ?? 9 * 60;
+  let lastGeo = null;
   let lunchUsed = false;
   let dinnerUsed = false;
+  const last = items.length - 1;
 
   items.forEach((stop, i) => {
+    const loc = stopLocation(stop);
     if (i > 0) {
-      const t = estimateTravel(stopLocation(items[i - 1]), stopLocation(stop));
-      cursor += t ? t.minutes : 15;
-    }
-    if (stopLocation(stop).type === "food") {
-      // 早于午餐窗口 → 推到午餐；晚于 15:00 → 晚餐窗口
-      if (!lunchUsed && cursor < MEAL.lunch[1] && cursor >= 9 * 60) {
-        cursor = Math.max(cursor, MEAL.lunch[0]);
-        lunchUsed = true;
-      } else if (!dinnerUsed && cursor < MEAL.dinner[1]) {
-        cursor = Math.max(cursor, MEAL.dinner[0]);
-        dinnerUsed = true;
+      if (isMeal(stop)) cursor += 0;
+      else {
+        const t = estimateTravel(lastGeo || stopLocation(items[i - 1]), loc);
+        cursor += t ? t.minutes : 15;
       }
     }
-    cursor = snap15(cursor);
-    stop.time = fromMin(cursor);
+    if (stop.locked && toMin(stop.time) != null) {
+      cursor = toMin(stop.time);
+    } else {
+      let win = null;
+      if (isMeal(stop)) win = stop.activity === "晚餐" ? MEAL.dinner : MEAL.lunch;
+      else if (insights(loc).window) win = insights(loc).window;
+      else if (loc.type === "food") {
+        if (!lunchUsed && cursor < MEAL.lunch[1] && cursor >= 9 * 60) {
+          win = MEAL.lunch;
+          lunchUsed = true;
+        } else if (!dinnerUsed && cursor < MEAL.dinner[1] && cursor >= 15 * 60) {
+          win = MEAL.dinner;
+          dinnerUsed = true;
+        }
+      }
+      if (win && cursor < win[0]) {
+        // 剩下的都是傍晚 / 夜间景点：下午留给自由活动，到点再去
+        const eveningTail = win[0] >= 17 * 60 && items.slice(i).filter((x) => !isMeal(x)).every((x) => (insights(stopLocation(x)).window?.[0] ?? 0) >= 17 * 60);
+        const patient = i === last || win[0] >= 17 * 60 || isMeal(stop) || loc.type === "food";
+        if (eveningTail || win[0] - cursor <= (patient ? 150 : 60)) cursor = win[0];
+      }
+      cursor = snap15(cursor);
+      stop.time = fromMin(cursor);
+    }
     cursor += stopDuration(stop);
+    if (hasCoords(loc)) lastGeo = loc;
   });
   return { ...day, items };
 }
@@ -245,15 +337,22 @@ function* permutations(arr) {
   }
 }
 
-function twoOpt(points) {
-  let best = points.slice();
+/** 路程 + 时段倒挂惩罚（夜景排在白天景点前面代价很高），与后端 _order_day 一致 */
+function routeCost(entries) {
+  let inversions = 0;
+  for (let i = 0; i < entries.length; i++) for (let j = i + 1; j < entries.length; j++) if (entries[i].rank > entries[j].rank) inversions++;
+  return pathLength(entries.map((e) => e.loc)) + inversions * 15000;
+}
+
+function twoOpt(entries) {
+  let best = entries.slice();
   let improved = true;
   while (improved) {
     improved = false;
     for (let i = 0; i < best.length - 1; i++) {
       for (let j = i + 1; j < best.length; j++) {
         const cand = [...best.slice(0, i), ...best.slice(i, j + 1).reverse(), ...best.slice(j + 1)];
-        if (pathLength(cand.map((p) => p.loc)) + 1 < pathLength(best.map((p) => p.loc))) {
+        if (routeCost(cand) + 1 < routeCost(best)) {
           best = cand;
           improved = true;
         }
@@ -263,28 +362,45 @@ function twoOpt(points) {
   return best;
 }
 
+/** 按排好的时间把用餐时段放回合适的位置（饭点之前的最后一站之后） */
+function placeMeals(items, meals, startTime) {
+  if (!meals.length) return items;
+  const timed = reflowDay({ items }, { startTime }).items;
+  const out = [...items];
+  meals.forEach((meal) => {
+    const lo = meal.activity === "晚餐" ? MEAL.dinner[0] : MEAL.lunch[0];
+    const idx = timed.findIndex((s) => toMin(s.time) >= lo);
+    const at = idx < 0 ? out.length : Math.max(1, out.indexOf(items[idx]));
+    out.splice(at, 0, meal);
+  });
+  return out;
+}
+
 /**
- * 在保持「第一站」不变的前提下，重排当天景点使总通勤最短。
- * ≤8 个点暴力枚举（最优），更多用 2-opt。无坐标的点保持在末尾。
+ * 重排当天景点使总通勤最短，同时尽量让「傍晚 / 夜间最佳」的景点排在后面。
+ * 默认保持第一站不变；≤8 个点暴力枚举（最优），更多用 2-opt。
+ * 用餐时段不参与排序，排完后按时间放回饭点位置；无坐标的点放在末尾。
  * 返回 { day, savedMeters }。
  */
 export function optimizeDay(day, { lockFirst = true } = {}) {
   const items = (day.items || []).filter(Boolean);
-  const geo = items.filter((s) => hasCoords(stopLocation(s))).map((s) => ({ s, loc: stopLocation(s) }));
-  const rest = items.filter((s) => !hasCoords(stopLocation(s)));
+  const meals = items.filter(isMeal);
+  const geo = items.filter((s) => !isMeal(s) && hasCoords(stopLocation(s))).map((s) => ({ s, loc: stopLocation(s), rank: windowRank(s) }));
+  const rest = items.filter((s) => !isMeal(s) && !hasCoords(stopLocation(s)));
   if (geo.length < 3) return { day, savedMeters: 0 };
 
   const head = lockFirst ? [geo[0]] : [];
   const movable = lockFirst ? geo.slice(1) : geo;
-  const before = pathLength(geo.map((g) => g.loc));
+  const before = routeCost(geo);
+  const beforeLen = pathLength(geo.map((g) => g.loc));
 
   let best;
   if (movable.length <= 8) {
     let min = Infinity;
     for (const perm of permutations(movable)) {
-      const len = pathLength([...head, ...perm].map((g) => g.loc));
-      if (len < min) {
-        min = len;
+      const c = routeCost([...head, ...perm]);
+      if (c < min) {
+        min = c;
         best = perm;
       }
     }
@@ -293,9 +409,10 @@ export function optimizeDay(day, { lockFirst = true } = {}) {
   }
 
   const ordered = [...head, ...best];
-  const after = pathLength(ordered.map((g) => g.loc));
-  if (after >= before - 50) return { day, savedMeters: 0 };
-  return { day: { ...day, items: [...ordered.map((g) => g.s), ...rest] }, savedMeters: Math.round((before - after) * 1.3) };
+  if (routeCost(ordered) >= before - 50) return { day, savedMeters: 0 };
+  const startTime = items.find((s) => toMin(s.time) != null)?.time || "09:30";
+  const next = placeMeals([...ordered.map((g) => g.s), ...rest], meals, startTime);
+  return { day: { ...day, items: next }, savedMeters: Math.max(0, Math.round((beforeLen - pathLength(ordered.map((g) => g.loc))) * 1.3)) };
 }
 
 // ------------------------------------------------------------------ 预算 ----
@@ -411,8 +528,20 @@ export function buildPackingList({ days = 2, weather = [], persona = null, itine
   if (foodStops >= 4) carry.push(["stomach", "肠胃药", `行程里有 ${foodStops} 顿美食，胃要争气`]);
   g("carry", "随身小物", carry);
 
+  // 行程里真正需要预约 / 有末班时间 / 有闭馆日的地点（来自景点数据，不是泛泛提醒）
+  const stops = (itinerary?.days || []).flatMap((d) => d.items || []).filter((s) => !isMeal(s));
+  const plan = [];
+  stops.forEach((s) => {
+    const info = insights(stopLocation(s));
+    const name = stopName(s);
+    if (info.needsBooking) plan.push([`book-${name}`, `预约 / 订位：${name}`, stopLocation(s).tips || "热门时段容易约满"]);
+    if (info.lastTime != null) plan.push([`last-${name}`, `记下末班时间：${name} ${fromMin(info.lastTime)}`]);
+    if (info.closedWeekdays.length) plan.push([`closed-${name}`, `确认开放日：${name}（周${info.closedWeekdays.map((w) => WEEKDAY_CN[w]).join("、")}不开放）`]);
+  });
+  g("plan", "出发前确认", plan);
+
   const extra = [];
-  if (persona?.mbti?.[2] === "P") extra.push(["book", "预约类景点提前订好", "计划依赖型：热门场馆常需预约"]);
+  if (persona?.mbti?.[2] === "P" && !plan.length) extra.push(["book", "热门场馆提前看看是否需要预约", "计划依赖型：提前确认更安心"]);
   if (hasBuddy) extra.push(["split", "和搭子约好集合点与 AA 规则"]);
   g("extra", "个性化提醒", extra);
 

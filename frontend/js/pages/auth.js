@@ -1,7 +1,7 @@
 import { h } from "../core/dom.js";
 import { icon } from "../core/icons.js";
 import { decoImg } from "../core/config.js";
-import { login, register } from "../services/auth.js";
+import { login, register, guest } from "../services/auth.js";
 import { state, storage } from "../core/state.js";
 import { toast } from "../ui/toast.js";
 
@@ -94,7 +94,22 @@ export default {
             h("h2", null, isRegister ? "创建账号" : "欢迎登机"),
             form,
             h("hr", { class: "perf" }),
-            h("p", { class: "auth-switch" }, isRegister ? "已有账号？" : "还没有账号？", h("a", { href: isRegister ? "#/login" : "#/register" }, isRegister ? "去登录" : "立即注册"))
+            h("p", { class: "auth-switch" }, isRegister ? "已有账号？" : "还没有账号？", h("a", { href: isRegister ? "#/login" : "#/register" }, isRegister ? "去登录" : "立即注册")),
+            h("button", { class: "btn btn--ghost btn--block guest-btn", type: "button", onclick: async (e) => {
+              const btn = e.currentTarget;
+              btn.classList.add("is-loading");
+              btn.disabled = true;
+              try {
+                await guest();
+                toast("已用游客身份进入，之后可以在右上角「设置账号」保存进度");
+                ctx.navigate(state.persona ? "plan" : "persona");
+              } catch (ex) {
+                showErr(ex.message);
+              } finally {
+                btn.classList.remove("is-loading");
+                btn.disabled = false;
+              }
+            } }, icon("compass"), "先逛逛，不注册")
           )
         )
       )

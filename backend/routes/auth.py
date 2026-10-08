@@ -137,6 +137,59 @@ def register():
         db.close()
 
 
+@auth_bp.route("/guest", methods=["POST"])
+def guest():
+    """游客模式：不用注册直接开始。数据同样保存在服务端，之后可在「设置账号」里转为正式账号。"""
+    db = get_db()
+    try:
+        for _ in range(5):
+            username = f"旅客{secrets.randbelow(900000) + 100000}"
+            if not db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                break
+        token = _generate_token()
+        cur = db.execute(
+            "INSERT INTO users (username, password_hash, session_token, is_guest) VALUES (?, ?, ?, 1)",
+            (username, _hash_password(secrets.token_urlsafe(24)), token),
+        )
+        db.commit()
+        return jsonify({"user": {"id": cur.lastrowid, "username": username, "is_guest": True}, "token": token}), 201
+    except Exception as e:
+        return _server_error(db, e, "创建游客")
+    finally:
+        db.close()
+
+
+@auth_bp.route("/account", methods=["PUT"])
+@login_required
+def claim_account():
+    """游客转正：设置用户名和密码，行程与人格测试结果全部保留"""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not g.user.get("is_guest"):
+        return jsonify({"error": "当前已经是正式账号"}), 400
+    if len(username) < 3 or len(username) > 20:
+        return jsonify({"error": "用户名长度需为 3-20 个字符"}), 400
+    if not re.match(r'^[a-zA-Z0-9_一-鿿]+$', username):
+        return jsonify({"error": "用户名只能包含字母、数字、下划线或中文"}), 400
+    if len(password) < 6 or len(password) > 20:
+        return jsonify({"error": "密码长度需为 6-20 个字符"}), 400
+    db = get_db()
+    try:
+        if db.execute("SELECT 1 FROM users WHERE username = ? AND id != ?", (username, g.user["id"])).fetchone():
+            return jsonify({"error": "用户名已存在"}), 409
+        db.execute(
+            "UPDATE users SET username = ?, password_hash = ?, is_guest = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (username, _hash_password(password), g.user["id"]),
+        )
+        db.commit()
+        return jsonify({"user": {"id": g.user["id"], "username": username, "is_guest": False}})
+    except Exception as e:
+        return _server_error(db, e, "设置账号")
+    finally:
+        db.close()
+
+
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """
@@ -195,6 +248,7 @@ def get_profile():
     profile = {
         "id": user["id"],
         "username": user["username"],
+        "is_guest": bool(user.get("is_guest")),
         "mbti_type": user["mbti_type"],
         "mbti_result": json.loads(user["mbti_result"]) if user["mbti_result"] else None,
         "travel_history": trips_repo.list_trips(user["id"], full=True),

@@ -133,7 +133,7 @@ function loadScript(src) {
 }
 
 export async function downloadPoster() {
-  await loadScript("https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js");
+  await loadScript("vendor/html2canvas.min.js"); // 本地内置，离线也能生成海报
   if (document.fonts?.ready) await document.fonts.ready;
   const wrap = h("div", { style: "position:fixed;left:-9999px;top:0;pointer-events:none" }, buildPoster());
   document.body.append(wrap);

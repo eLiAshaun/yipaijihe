@@ -6,6 +6,7 @@ import { PACES, paceFromPersona, fmtDate, isoDate } from "../services/planner.js
 import { listTrips, applyTrip } from "../services/trips.js";
 import { api } from "../core/api.js";
 import { openTripsModal } from "../ui/header.js";
+import { getConfig } from "../services/config.js";
 import { toast } from "../ui/toast.js";
 
 const BUDGET_PRESETS = [300, 500, 1000, 2000, 3500];
@@ -122,11 +123,39 @@ export default {
 
     const field = (label, ...kids) => h("div", { class: "field" }, h("span", { class: "field-label" }, label), ...kids);
 
+    // ------ 目的地：有内置景点库的城市 + 开启联网搜索后的任意城市 ------
+    const cityBox = h("div", { class: "city-box" }, h("span", { class: "chip is-active" }, icon("pin"), t.city));
+    const setCity = (name) => {
+      name = (name || "").trim();
+      if (!name || name === t.city) return;
+      t.city = name;
+      // 换城市后，之前城市的地点池和视频分析结果不再适用
+      state.places = [];
+      state.selectedIds = new Set();
+      state.videoAnalysis = null;
+      renderCities();
+      refresh();
+    };
+    let cfg = null;
+    function renderCities() {
+      if (!cfg) return;
+      const known = cfg.cities.map((c) => c.name);
+      const chips = [...new Set([...known, t.city])].map((name) => {
+        const c = cfg.cities.find((x) => x.name === name);
+        return h("button", { class: "chip", type: "button", "aria-pressed": String(name === t.city), onclick: () => setCity(name) }, icon("pin"), name, c ? h("small", { class: "faint" }, ` ${c.places} 个地点`) : null);
+      });
+      const other = cfg.web_search
+        ? h("form", { class: "city-other", onsubmit: (e) => (e.preventDefault(), setCity(e.target.city.value)) }, h("input", { class: "input", name: "city", placeholder: "其他城市，如 杭州", "aria-label": "其他城市" }), h("button", { class: "btn btn--quiet btn--sm", type: "submit" }, "去这里"))
+        : h("p", { class: "hint" }, "目前内置了上海的景点库。想规划其他城市，在 .env 里配置 DOUBAO_API_KEY 开启联网搜索。");
+      mountInto(cityBox, h("div", { class: "chip-row" }, chips), other);
+    }
+    getConfig().then((c) => ((cfg = c), ctx.alive() && renderCities())).catch(() => {});
+
     const form = h(
       "div",
       { class: "plan-form ticket", style: { "--stub": "100%" } },
       h("div", { class: "plan-grid" },
-        field("目的地", h("div", { class: "chip-row" }, h("span", { class: "chip is-active" }, icon("pin"), "上海"), h("span", { class: "chip", "aria-disabled": "true" }, "更多城市即将开放"))),
+        field("目的地", cityBox),
         h("div", { class: "field" }, h("label", { for: "f-date" }, "出发日期", h("span", { class: "faint" }, "（选填）")), date, h("span", { class: "hint" }, "填写后可查看逐日天气，并导出到手机日历")),
         field("旅行天数", daysCtl),
         field("旅行节奏", paceSeg, paceHint),

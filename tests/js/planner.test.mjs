@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  toMin, fromMin, haversine, estimateTravel, dayStats, dayWarnings, reflowDay, optimizeDay,
+  toMin, fromMin, haversine, estimateTravel, dayStats, dayWarnings, reflowDay, optimizeDay, daySegments,
   estimateCost, buildIcs, buildPackingList, buddyCompatibility, paceFromPersona, weatherInfo, toShareText,
+  insights, mealBlock,
 } from "../../frontend/js/services/planner.js";
 
 const P = (name, lat, lng, type = "landmark", extra = {}) => ({
@@ -140,4 +141,73 @@ test("buddy compatibility & pace inference", () => {
   assert.equal(paceFromPersona({ mbti: "DRPC" }), "packed");
   assert.equal(paceFromPersona({ mbti: "DRPT" }), "relaxed");
   assert.equal(dayStats({ items: [] }).count, 0);
+});
+
+// ------------------------------------------------------------- 第二轮 ----
+const M50 = P("M50创意园", 31.252, 121.459, "culture", { tips: "周一多数画廊闭馆，建议周二至周日前往", best_time: "工作日下午" });
+const NIGHT = P("外滩夜景", 31.24, 121.49, "landmark", { best_time: "傍晚-夜间", tips: "日落前30分钟到达最佳" });
+const FERRY = P("东昌路渡轮码头", 31.235, 121.505, "landmark", { risks: "末班船约21:00，注意时间", best_time: "傍晚" });
+const BOOK = P("哥伦比亚公园", 31.22, 121.418, "culture", { risks: "部分区域需预约" });
+
+test("insights parse closures, booking, last ferry and best-time windows (same rules as backend)", () => {
+  assert.deepEqual(insights(M50.location).closedWeekdays, [0]);
+  assert.equal(insights(M50.location).weekdayOnly, true);
+  assert.equal(insights(BOOK.location).needsBooking, true);
+  assert.equal(insights({ tips: "无需预约" }).needsBooking, false);
+  assert.equal(insights(FERRY.location).lastTime, 21 * 60);
+  assert.deepEqual(insights(NIGHT.location).window, [17 * 60, 22 * 60]);
+  assert.equal(insights({ best_time: "全天" }).window, null);
+});
+
+test("meal blocks: zero travel in, next stop travels from the last real place", () => {
+  const meal = { ...mealBlock("lunch"), __stopId: "meal" };
+  const day = reflowDay({ items: [BUND, meal, YUYUAN] }, { startTime: "10:30" });
+  const segs = daySegments(day);
+  assert.equal(segs[1].travel.minutes, 0);
+  assert.equal(segs[1].start, 11 * 60 + 30); // 落在午餐窗口
+  assert.deepEqual(segs[2].travel, estimateTravel(BUND.location, YUYUAN.location));
+  assert.equal(dayStats(day).count, 2); // 用餐不算景点数
+});
+
+test("reflow keeps locked times and waits for evening windows", () => {
+  const locked = { ...YUYUAN, time: "15:00", locked: true };
+  const day = reflowDay({ items: [BUND, locked, NIGHT] }, { startTime: "09:00" });
+  assert.equal(day.items[1].time, "15:00");
+  assert.equal(toMin(day.items[2].time), 17 * 60); // 夜景等到傍晚
+});
+
+test("warnings: closed day, last ferry, booking and best-time mismatch", () => {
+  const monday = new Date(2026, 9, 12);
+  const w = (items, date) => dayWarnings({ items }, "balanced", { date }).map((x) => x.code);
+  assert.ok(w([{ ...M50, time: "14:00" }], monday).includes("closed"));
+  assert.ok(!w([{ ...M50, time: "14:00" }], new Date(2026, 9, 13)).includes("closed"));
+  assert.ok(w([{ ...FERRY, time: "20:45" }]).includes("last-time"));
+  assert.ok(w([{ ...BOOK, time: "14:00" }]).includes("booking"));
+  assert.ok(w([{ ...NIGHT, time: "10:00" }]).includes("best-time"));
+  assert.ok(w([{ ...M50, time: "14:00" }], new Date(2026, 9, 17)).includes("weekend"));
+});
+
+test("optimizeDay keeps lunch mid-day and the night view last", () => {
+  const meal = { ...mealBlock("lunch"), __stopId: "meal" };
+  const day = reflowDay({ items: [BUND, NIGHT, meal, WUKANG, YUYUAN, TIANZIFANG] }, { startTime: "09:30" });
+  const { day: better } = optimizeDay(day);
+  const names = better.items.map((s) => s.__stopId || s.kind);
+  assert.equal(names[names.length - 1], "外滩夜景");
+  const mi = names.indexOf("meal");
+  assert.ok(mi > 0 && mi < names.length - 1, names.join(","));
+});
+
+test("packing list turns real data into pre-trip checks", () => {
+  const list = buildPackingList({ days: 1, itinerary: { days: [{ items: [BOOK, FERRY, M50] }] } });
+  const plan = list.find((g) => g.id === "plan");
+  const text = plan.items.map((i) => i.text).join("|");
+  assert.match(text, /预约 \/ 订位：哥伦比亚公园/);
+  assert.match(text, /末班时间：东昌路渡轮码头 21:00/);
+  assert.match(text, /确认开放日：M50创意园（周一不开放）/);
+});
+
+test("evening-only tail waits until dusk even after a short day", () => {
+  const day = reflowDay({ items: [YUYUAN, NIGHT, FERRY] }, { startTime: "10:00" });
+  assert.equal(day.items[1].time, "17:00");
+  assert.ok(toMin(day.items[2].time) >= 18 * 60);
 });

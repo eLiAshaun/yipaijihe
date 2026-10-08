@@ -5,6 +5,10 @@
 
 import logging
 import os
+import socket
+import sys
+import threading
+import webbrowser
 
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
@@ -62,21 +66,32 @@ def create_app():
     # ---------- 公共 API ----------
     @app.get("/api/health")
     def health():
+        from backend.services.llm_service import llm_status
+
         return {
             "status": "ok",
             "llm_configured": Config.HAS_LLM,
-            "model": Config.LLM_MODEL if Config.HAS_LLM else "demo_mode",
+            "model": Config.LLM_MODEL if Config.HAS_LLM else "local_engine",
+            "capabilities": llm_status(),
         }
 
     @app.get("/api/config")
     def public_config():
-        """下发前端所需的公开配置（地图 Key 等），避免写死在 HTML 里"""
+        """下发前端所需的公开配置（地图 Key、可用能力），避免写死在 HTML 里"""
+        from backend.services.llm_service import llm_status
+        from backend.database import list_cities
+
+        caps = llm_status()
         return {
             "amap": {
                 "key": Config.AMAP_JS_KEY,
                 "securityJsCode": Config.AMAP_SECURITY_CODE,
             },
-            "llm": Config.HAS_LLM,
+            "llm": caps["llm"],
+            "web_search": caps["web_search"],
+            "asr": caps["asr"],
+            # 有内置景点库的城市；开启联网搜索后可以规划任意城市
+            "cities": list_cities(),
         }
 
     # ---------- 安全响应头 ----------
@@ -100,8 +115,37 @@ def create_app():
     return app
 
 
-if __name__ == "__main__":
+def _free_port(host: str, preferred: int, attempts: int = 20) -> int:
+    """端口被占用（常见：macOS AirPlay 占 5000、本机已有服务占 8000）时顺延到下一个可用端口"""
+    for port in range(preferred, preferred + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host if host != "0.0.0.0" else "", port))
+                return port
+            except OSError:
+                continue
+    raise SystemExit(f"端口 {preferred}-{preferred + attempts - 1} 都被占用，请在 .env 里设置 FLASK_PORT")
+
+
+def main():
+    if sys.version_info < (3, 10):
+        raise SystemExit("需要 Python 3.10 及以上版本")
     application = create_app()
-    logger.info("🚀 一拍迹合启动在 http://localhost:%s", Config.PORT)
-    logger.info("📊 LLM 模式: %s", "API" if Config.HAS_LLM else "Demo（未配置 API Key）")
-    application.run(host="0.0.0.0", port=Config.PORT, debug=Config.DEBUG)
+    port = _free_port(Config.HOST, Config.PORT)
+    url = f"http://{'127.0.0.1' if Config.HOST in ('0.0.0.0', '') else Config.HOST}:{port}"
+    if port != Config.PORT:
+        logger.info("端口 %s 已被占用，改用 %s", Config.PORT, port)
+    logger.info("🚀 一拍迹合已启动：%s", url)
+    logger.info(
+        "🧠 AI：%s ｜ 联网搜索：%s ｜ 语音转写：%s",
+        f"已配置（{Config.LLM_MODEL}）" if Config.HAS_LLM else "未配置，使用本地规则引擎",
+        "开启" if Config.HAS_WEB_SEARCH else "未开启",
+        "开启" if Config.HAS_ASR else "未开启（用视频标题 / 文案提取地点）",
+    )
+    if os.getenv("OPEN_BROWSER") == "1" and not os.getenv("WERKZEUG_RUN_MAIN"):
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    application.run(host=Config.HOST, port=port, debug=Config.DEBUG, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -2,7 +2,7 @@ import { api } from "../core/api.js";
 import { state, setToken, resetAll, bus, clearDraft } from "../core/state.js";
 
 function applyProfile(profile) {
-  state.user = { id: profile.id, username: profile.username, created_at: profile.created_at };
+  state.user = { id: profile.id, username: profile.username, created_at: profile.created_at, is_guest: !!profile.is_guest };
   state.persona = profile.mbti_result?.mbti ? profile.mbti_result : null;
   state.trips = profile.travel_history;
   bus.emit("auth:change", state.user);
@@ -36,6 +36,18 @@ export async function login(username, password) {
 
 export async function register(username, password) {
   return enter(await api.post("/api/auth/register", { username, password }));
+}
+
+/** 游客模式：不注册直接开始，之后可以「设置账号」转为正式账号 */
+export async function guest() {
+  return enter(await api.post("/api/auth/guest"));
+}
+
+export async function claimAccount(username, password) {
+  const { user } = await api.put("/api/auth/account", { username, password });
+  state.user = { ...state.user, username: user.username, is_guest: false };
+  bus.emit("auth:change", state.user);
+  return user;
 }
 
 export async function logout({ remote = true } = {}) {

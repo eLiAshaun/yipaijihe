@@ -85,3 +85,4 @@ body:has(.action-bar) .fab { bottom: calc(96px + env(safe-area-inset-bottom)); }
   .place-filters { position: static; backdrop-filter: none; }
 }
 body:has(.action-bar) .toasts { bottom: calc(100px + env(safe-area-inset-bottom)); }
+.filter-actions { display: inline-flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }

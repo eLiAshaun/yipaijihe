@@ -5,6 +5,7 @@ from backend.routes.buddy import buddy_bp
 from backend.routes.chat import chat_bp
 from backend.routes.itinerary import itinerary_bp
 from backend.routes.locations import locations_bp
+from backend.routes.inspiration import inspiration_bp
 from backend.routes.mbti import mbti_bp
 from backend.routes.trips import trips_bp, weather_bp
 from backend.routes.video import video_bp
@@ -19,6 +20,7 @@ BLUEPRINTS = (
     (buddy_bp, "/api/buddy"),
     (trips_bp, "/api/trips"),
     (weather_bp, "/api/weather"),
+    (inspiration_bp, "/api/inspiration"),
 )
 
 

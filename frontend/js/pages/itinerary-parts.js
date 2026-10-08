@@ -3,7 +3,8 @@ import { h } from "../core/dom.js";
 import { icon, typeIcon, typeLabel } from "../core/icons.js";
 import { storage, state } from "../core/state.js";
 import { STORAGE } from "../core/config.js";
-import { toMin, fromMin, fmtDuration, TRAVEL_MODES, stopName, stopLocation, stopDuration, buildPackingList } from "../services/planner.js";
+import { toMin, fromMin, fmtDuration, TRAVEL_MODES, stopName, stopLocation, stopDuration, buildPackingList, isMeal } from "../services/planner.js";
+import { navUrl, nearbyUrl } from "../services/links.js";
 
 // --------------------------------------------------------------- 时间选项 ----
 function timeOptions(selected) {
@@ -28,39 +29,59 @@ const FEEDBACK = {
 };
 
 // ---------------------------------------------------------------- 景点卡片 ----
-/** act: { select, move, moveDay, remove, feedback, time, duration } */
-export function stopCard({ stop, di, si, count, days, active, feedback, warn }, act) {
+/**
+ * act: { select, move, moveDay, remove, feedback, time, duration, lock }
+ * anchor：用餐时段之前最近的有坐标地点（用来搜附近餐厅）
+ */
+export function stopCard({ stop, di, si, count, days, active, feedback, warn, anchor, city }, act) {
   const loc = stopLocation(stop);
   const name = stopName(stop);
   const dur = stopDuration(stop);
   const fb = feedback && FEEDBACK[feedback];
+  const meal = isMeal(stop);
+  const id = stop.__stopId;
+  const btn = (ic, label, onclick, extra = {}) => h("button", { class: ["icon-btn icon-btn--sm", extra.cls], type: "button", "aria-label": label, title: label, onclick, ...extra.attrs }, icon(ic));
+  const link = (ic, label, href) => h("a", { class: "icon-btn icon-btn--sm", href, target: "_blank", rel: "noopener noreferrer", "aria-label": label, title: label }, icon(ic));
+
+  const actions = [
+    btn(stop.locked ? "lock" : "unlock", stop.locked ? "已锁定时间（自动排时间不会改动）" : "锁定时间：订好的餐厅 / 门票", () => act.lock(id), { cls: stop.locked && "is-on", attrs: { "aria-pressed": String(!!stop.locked) } }),
+    btn("arrow-up", "上移", () => act.move(di, si, -1), { attrs: { disabled: si === 0 } }),
+    btn("arrow-down", "下移", () => act.move(di, si, 1), { attrs: { disabled: si === count - 1 } }),
+    days > 1 && btn(di < days - 1 ? "chevron-right" : "arrow-left", di < days - 1 ? "移到下一天" : "移到上一天", () => act.moveDay(di, si, di < days - 1 ? 1 : -1)),
+  ];
+  if (meal) {
+    actions.push(link("food", "在高德搜附近餐厅", nearbyUrl(anchor, "美食", city)));
+  } else {
+    actions.push(
+      link("nav", "导航到这里", navUrl(loc)),
+      ...["like", "must"].map((k) => btn(FEEDBACK[k].icon, FEEDBACK[k].label, () => act.feedback(id, k), { cls: feedback === k && "is-on", attrs: { "aria-pressed": String(feedback === k) } })),
+      btn("refresh", "换一个类似的", () => act.feedback(id, "dislike"))
+    );
+  }
+  actions.push(btn("trash", `删除 ${name}`, () => act.remove(id), { cls: "danger" }));
 
   return h(
     "li",
-    { class: ["stop", active && "is-active", warn && "has-warn"], "data-id": stop.__stopId, "data-di": di, "data-si": si },
+    { class: ["stop", meal && "stop--meal", active && "is-active", warn && "has-warn", stop.locked && "is-locked"], "data-id": id, "data-di": di, "data-si": si },
     h("div", { class: "stop-time" },
-      h("select", { class: "select select--time", "aria-label": `${name} 开始时间`, onchange: (e) => act.time(stop.__stopId, e.target.value), onclick: (e) => e.stopPropagation() }, timeOptions(stop.time))),
+      h("select", { class: "select select--time", "aria-label": `${name} 开始时间`, onchange: (e) => act.time(id, e.target.value), onclick: (e) => e.stopPropagation() }, timeOptions(stop.time)),
+      stop.locked && h("span", { class: "lock-badge", title: "时间已锁定" }, icon("lock"))),
     h("div", { class: "stop-rail", "aria-hidden": "true" }, h("i", { class: "stop-dot" })),
     h(
       "div",
-      { class: "stop-card", tabindex: 0, role: "button", "aria-label": `${name}，点击在地图上查看`, onclick: () => act.select(stop.__stopId), onkeydown: (e) => (e.key === "Enter" || e.key === " ") && e.target === e.currentTarget && (e.preventDefault(), act.select(stop.__stopId)) },
+      { class: "stop-card", tabindex: 0, role: "button", "aria-label": `${name}${meal ? "" : "，点击在地图上查看"}`, onclick: () => act.select(id), onkeydown: (e) => (e.key === "Enter" || e.key === " ") && e.target === e.currentTarget && (e.preventDefault(), act.select(id)) },
       h("div", { class: "stop-top" },
         h("span", { class: "stop-grip", "data-grip": "", title: "拖动排序", "aria-hidden": "true" }, icon("grip")),
         h("h4", { class: "stop-name" }, name),
-        loc.type && h("span", { class: "type-badge", "data-type": loc.type }, icon(typeIcon(loc.type)), typeLabel(loc.type)),
+        !meal && loc.type && h("span", { class: "type-badge", "data-type": loc.type }, icon(typeIcon(loc.type)), typeLabel(loc.type)),
+        meal && h("span", { class: "type-badge", "data-type": "food" }, icon("food"), "用餐"),
         fb && h("span", { class: ["tag", fb.tag] }, fb.label === "换一个" ? "已换" : fb.label)),
-      (stop.activity && stop.activity !== name) || stop.notes
-        ? h("p", { class: "stop-note" }, [stop.activity && stop.activity !== name ? stop.activity : "", stop.notes ? (stop.activity && stop.activity !== name ? " · " : "") + stop.notes : ""].join(""))
+      (stop.activity && stop.activity !== name && !meal) || stop.notes
+        ? h("p", { class: "stop-note" }, [!meal && stop.activity && stop.activity !== name ? stop.activity : "", stop.notes ? (!meal && stop.activity && stop.activity !== name ? " · " : "") + stop.notes : ""].join(""))
         : null,
       h("div", { class: "stop-tools", onclick: (e) => e.stopPropagation() },
-        h("label", { class: "dur", title: "停留时长" }, icon("clock"), h("select", { "aria-label": `${name} 停留时长`, onchange: (e) => act.duration(stop.__stopId, Number(e.target.value)) }, durationOptions(dur))),
-        h("span", { class: "stop-actions" },
-          h("button", { class: "icon-btn icon-btn--sm", type: "button", "aria-label": "上移", disabled: si === 0, onclick: () => act.move(di, si, -1) }, icon("arrow-up")),
-          h("button", { class: "icon-btn icon-btn--sm", type: "button", "aria-label": "下移", disabled: si === count - 1, onclick: () => act.move(di, si, 1) }, icon("arrow-down")),
-          days > 1 && h("button", { class: "icon-btn icon-btn--sm", type: "button", "aria-label": di < days - 1 ? "移到下一天" : "移到上一天", title: di < days - 1 ? "移到下一天" : "移到上一天", onclick: () => act.moveDay(di, si, di < days - 1 ? 1 : -1) }, icon(di < days - 1 ? "chevron-right" : "arrow-left")),
-          ["like", "must"].map((k) => h("button", { class: ["icon-btn icon-btn--sm", feedback === k && "is-on"], type: "button", "aria-pressed": String(feedback === k), "aria-label": FEEDBACK[k].label, title: FEEDBACK[k].label, onclick: () => act.feedback(stop.__stopId, k) }, icon(FEEDBACK[k].icon))),
-          h("button", { class: "icon-btn icon-btn--sm", type: "button", "aria-label": "换一个类似的", title: "换一个类似的", onclick: () => act.feedback(stop.__stopId, "dislike") }, icon("refresh")),
-          h("button", { class: "icon-btn icon-btn--sm danger", type: "button", "aria-label": `删除 ${name}`, title: "删除", onclick: () => act.remove(stop.__stopId) }, icon("trash")))
+        h("label", { class: "dur", title: "停留时长" }, icon("clock"), h("select", { "aria-label": `${name} 停留时长`, onchange: (e) => act.duration(id, Number(e.target.value)) }, durationOptions(dur))),
+        h("span", { class: "stop-actions" }, actions)
       )
     )
   );
@@ -72,8 +93,9 @@ export function travelConnector(seg) {
   if (!t) {
     return h("li", { class: "travel travel--unknown", "aria-hidden": "true" }, h("span", null, "无法估算通勤"));
   }
-  const m = TRAVEL_MODES[t.mode];
   const tight = seg.slack != null && seg.slack < -5;
+  if (t.virtual) return h("li", { class: ["travel travel--meal", tight && "is-tight"], "aria-hidden": "true" }, tight ? h("span", { class: "travel-warn" }, icon("alert"), `时间重叠 ${Math.abs(Math.round(seg.slack))} 分钟`) : h("span", null));
+  const m = TRAVEL_MODES[t.mode];
   return h(
     "li",
     { class: ["travel", tight && "is-tight"], "aria-label": `通勤 ${m.label} ${t.minutes} 分钟` },

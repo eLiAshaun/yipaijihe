@@ -7,7 +7,7 @@
  *   view.setRoutes([{ id, from, to, color }], "transfer")   // Promise，可被后续调用取消
  *   view.focus(id) / view.fit(ids?) / view.destroy()
  */
-import { api } from "../core/api.js";
+import { getConfig } from "./config.js";
 import { h } from "../core/dom.js";
 import { hasCoords } from "./planner.js";
 
@@ -26,7 +26,7 @@ function loadScript(src, timeout = 9000) {
 
 export function loadAMap() {
   amapPromise ||= (async () => {
-    const cfg = await api.get("/api/config");
+    const cfg = await getConfig();
     if (!cfg.amap?.key) throw new Error("no key");
     window._AMapSecurityConfig = { securityJsCode: cfg.amap.securityJsCode };
     await loadScript(`https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(cfg.amap.key)}`);

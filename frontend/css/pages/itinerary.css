@@ -183,7 +183,7 @@
 .pk-text small { color: var(--ink-3); font-size: var(--fs-xs); }
 
 @media (max-width: 1080px) {
-  .itin-split { --mapH: 44vh; }
+  .itin-split { --mapH: 44vh; grid-template-columns: 1fr; }
   .day-bar { top: calc(var(--topbar-h) + var(--mapH) + 4px); }
   .map-card { max-height: calc(100% - 28px); overflow: auto; width: min(320px, calc(100% - 28px)); }
   .stop, .travel { grid-template-columns: 76px 16px 1fr; }
@@ -196,3 +196,25 @@
   .travel > * { grid-column: 1; }
   .drop-indicator { margin-left: 0; }
 }
+
+/* ---- 第二轮：用餐时段 / 锁定 / 提醒 / 今日 ---- */
+.stop--meal .stop-card { background: color-mix(in srgb, var(--sun-soft) 55%, var(--card-2)); border-style: dashed; }
+.stop--meal .stop-dot { background: var(--sun); box-shadow: 0 0 0 2px var(--sun); }
+.travel--meal { min-height: 14px; }
+.stop.is-locked .select--time { border-color: var(--ink); font-weight: 500; }
+.stop-time { display: grid; gap: 4px; justify-items: start; }
+.lock-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: var(--r-pill); background: var(--ink); color: var(--paper); font-size: 0.68rem; }
+.lock-badge svg { width: 11px; height: 11px; }
+.stop.flash .stop-card { animation: flash 1.2s ease; }
+.card-flag { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--seal-strong); font-weight: 700; }
+.card-flag svg { width: 14px; height: 14px; }
+.trip-banner { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--r-md); background: var(--sea-soft); color: var(--sea); font-size: var(--fs-sm); flex-wrap: wrap; }
+.trip-banner > svg { width: 20px; height: 20px; flex: none; }
+.trip-banner > span { flex: 1; min-width: 200px; color: var(--ink); }
+.trip-banner b { color: var(--sea); }
+.trip-banner--live { background: var(--ink); color: var(--paper); }
+.trip-banner--live > span, .trip-banner--live b { color: var(--paper); }
+.trip-banner--live .btn--ink { --_bg: var(--seal); --_fg: var(--on-seal); }
+.add-meal { margin-top: 8px; align-items: center; font-size: var(--fs-sm); }
+.engine-note { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: var(--fs-xs); color: var(--ink-3); }
+.engine-note svg { width: 14px; height: 14px; }

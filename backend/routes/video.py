@@ -61,49 +61,57 @@ _INFERRED_LOCATION_ALIASES = {
 }
 
 
-def _process_single_video(url: str, index: int, total: int, mbti: str) -> dict:
-    """
-    处理单个视频：转写 + LLM 提取（在线程中运行）
+def _context_for(url: str, share_text: str) -> str:
+    """分享文案里与这条链接同一行 / 同一段的文字（抖音分享文案通常包含标题）"""
+    for block in re.split(r"\n\s*\n|\n", share_text or ""):
+        if url in block:
+            return block
+    return ""
 
-    Returns:
-        {
-            "index": int,
-            "success": bool,
-            "url": str,
-            "title": str,
-            "transcript": str | None,
-            "locations": list,
-            "error": str | None,
-        }
+
+def _process_single_video(url: str, index: int, total: int, mbti: str, share_text: str = "", city: str = "上海", catalog: list | None = None) -> dict:
     """
+    处理单个视频（在线程中运行）：
+      · 配置了语音转写（MIMO_API_KEY）：下载 → 转写 → 提取地点
+      · 没配置或转写失败：读取作品标题 / 文案 + 用户粘贴的分享文案 → 提取地点
+    """
+    from backend.services.inspiration import extract_places
+
     url = url.strip()
-    if not url:
-        return {"index": index, "success": False, "url": url, "error": "空链接", "locations": [], "title": "", "transcript": None}
-
+    base = {"index": index, "url": url, "title": "", "transcript": None, "locations": [], "error": None, "mode": ""}
     logger.info(f"[{index+1}/{total}] 开始处理视频: {url}")
 
-    # Step 1: 语音转写
-    transcript, video_title, err_msg = _transcribe_video(url)
+    asr_err = ""
+    if Config.HAS_ASR:
+        transcript, video_title, asr_err = _transcribe_video(url)
+        if transcript:
+            locations = _extract_locations_from_text(transcript, video_title, mbti)
+            return {**base, "success": True, "title": video_title, "transcript": transcript, "locations": locations, "mode": "asr"}
 
-    if not transcript:
-        logger.warning(f"[{index+1}/{total}] 转写失败: {url} - {err_msg}")
-        return {
-            "index": index, "success": False, "url": url,
-            "title": video_title, "transcript": None,
-            "locations": [], "error": err_msg,
-        }
+    title, title_err = "", ""
+    try:
+        from backend.services.video_processor import VideoProcessor
 
-    logger.info(f"[{index+1}/{total}] 转写成功，文本长度: {len(transcript)}")
+        title = VideoProcessor().fetch_title(url)
+    except Exception as e:  # noqa: BLE001 — 网络 / 链接失效
+        title_err = str(e)[:80]
+    text = "\n".join(t for t in (title, _context_for(url, share_text)) if t)
+    locations = extract_places(text, city, catalog or [])
+    if locations:
+        for loc in locations:
+            loc["source"] = "video"
+        return {**base, "success": True, "title": title, "locations": locations, "mode": "title"}
 
-    # Step 2: LLM 提取景点信息
-    locations = _extract_locations_from_text(transcript, video_title, mbti)
-    logger.info(f"[{index+1}/{total}] 提取到 {len(locations)} 个景点")
-
-    return {
-        "index": index, "success": True, "url": url,
-        "title": video_title, "transcript": transcript,
-        "locations": locations, "error": None,
-    }
+    reasons = []
+    if asr_err:
+        reasons.append(f"语音转写失败（{asr_err[:60]}）")
+    elif not Config.HAS_ASR:
+        reasons.append("未配置语音转写，只能读取标题和文案")
+    if title_err:
+        reasons.append(f"读取视频标题失败（{title_err}）")
+    elif title:
+        reasons.append(f"标题「{title[:30]}」里没有具体地点")
+    return {**base, "success": False, "title": title, "error": "；".join(reasons) or "没有识别到具体地点", "mode": "title"}
 
 
 @video_bp.route("/analyze", methods=["POST"])
@@ -132,6 +140,16 @@ def analyze_video():
         return jsonify({"error": "仅支持抖音视频链接（douyin.com / iesdouyin.com）", "invalid": bad[:3]}), 400
     personality = data.get("personality", {})
     mbti = personality.get("mbti", "")
+    share_text = str(data.get("text") or "")[:20000]
+    city = str(data.get("city") or "上海")[:20]
+    from backend.database import get_db as _get_db
+    from backend.routes.itinerary import _db_row_to_location
+
+    _db = _get_db()
+    try:
+        catalog = [_db_row_to_location(r) for r in _db.execute("SELECT * FROM attractions WHERE city = ?", (city,)).fetchall()]
+    finally:
+        _db.close()
 
     if not urls:
         return jsonify({"error": "请提供有效的视频链接"}), 400
@@ -140,7 +158,7 @@ def analyze_video():
 
     # 并行提交所有视频处理任务
     futures = {
-        _executor.submit(_process_single_video, url, i, len(urls), mbti): i
+        _executor.submit(_process_single_video, url, i, len(urls), mbti, share_text, city, catalog): i
         for i, url in enumerate(urls)
     }
 
@@ -168,18 +186,10 @@ def analyze_video():
         if r is None:
             continue
         if r["success"]:
-            transcripts.append({"url": r["url"], "title": r["title"], "text": r["transcript"]})
+            transcripts.append({"url": r["url"], "title": r["title"], "text": r["transcript"], "mode": r.get("mode")})
             all_locations.extend(r["locations"])
         else:
             errors.append({"url": r["url"], "error": r["error"]})
-
-    # 如果全部失败，降级到 demo 数据
-    if not all_locations:
-        logger.warning("所有视频转写失败，降级到 demo 数据")
-        result = _demo_analyze(urls, mbti)
-        result["fallback"] = True
-        result["errors"] = errors
-        return jsonify(result)
 
     # 去重（按景点名称）
     seen = set()
@@ -205,7 +215,7 @@ def analyze_video():
         "success_count": len(transcripts),
         "total_locations": len(unique_locations),
         "errors": errors,
-        "fallback": False,
+        "asr": Config.HAS_ASR,
     })
 
 
@@ -729,64 +739,6 @@ def _repair_truncated_json(text: str) -> str:
     return truncated + "\n]"
 
 
-def _demo_analyze(urls: list, mbti: str) -> dict:
-    """
-    Demo 模式：返回模拟分析结果（降级方案）
-    """
-    demo_locations = [
-        {
-            "name": "武康路",
-            "keywords": ["梧桐区", "法式建筑", "网红打卡", "咖啡街"],
-            "reason": "博主漫步在武康路的梧桐树荫下，推荐了沿途的精品咖啡馆和法式老洋房，非常适合拍照打卡。",
-            "labels": _match_labels(["文艺", "拍照", "咖啡"], mbti),
-            "lat": 31.2104,
-            "lng": 121.4380,
-        },
-        {
-            "name": "外滩",
-            "keywords": ["万国建筑", "黄浦江", "夜景", "经典地标"],
-            "reason": "视频展示了外滩夜景的震撼画面，博主推荐傍晚时分到达，可以看到日落和灯光秀的完美过渡。",
-            "labels": _match_labels(["夜景", "地标", "浪漫"], mbti),
-            "lat": 31.2400,
-            "lng": 121.4900,
-        },
-        {
-            "name": "田子坊",
-            "keywords": ["弄堂文化", "手工艺品", "小吃", "文艺"],
-            "reason": "博主深入田子坊的小巷，介绍了各种手工艺品店和地道小吃，推荐了网红冰淇淋和手工皂。",
-            "labels": _match_labels(["小吃", "文艺", "探店"], mbti),
-            "lat": 31.2180,
-            "lng": 121.4730,
-        },
-        {
-            "name": "新天地",
-            "keywords": ["石库门", "酒吧街", "时尚", "夜生活"],
-            "reason": "视频介绍了新天地的石库门建筑改造，推荐了这里的特色酒吧和高端餐厅，适合夜间出行。",
-            "labels": _match_labels(["时尚", "夜生活", "美食"], mbti),
-            "lat": 31.2180,
-            "lng": 121.4740,
-        },
-        {
-            "name": "豫园",
-            "keywords": ["古典园林", "城隍庙", "小笼包", "传统文化"],
-            "reason": "博主探访豫园古典园林，推荐了南翔小笼包和城隍庙周边的传统小吃，是体验上海传统文化的必去之地。",
-            "labels": _match_labels(["传统文化", "美食", "园林"], mbti),
-            "lat": 31.2270,
-            "lng": 121.4920,
-        },
-    ]
-
-    num = min(len(urls) * 2, len(demo_locations))
-    selected = demo_locations[:num]
-
-    return {
-        "locations": selected,
-        "summary": f"从 {len(urls)} 个视频中提取了 {len(selected)} 个景点（演示数据）",
-        "video_count": len(urls),
-        "total_locations": len(selected),
-    }
-
-
 def _match_labels(base_labels: list, mbti: str) -> list:
     """
     根据用户MBTI人格类型，匹配额外的个性化label
@@ -912,8 +864,8 @@ def _fill_coords(name: str, lat, lng):
         if key in name or name in key:
             return coords
 
-    # 最终兜底：上海市中心
-    return 31.2304, 121.4737
+    # 查不到就如实返回空，交给前端用地图搜索定位，而不是编造一个市中心坐标
+    return None, None
 
 
 def _infer_type_from_keywords(keywords: list) -> str:
@@ -949,6 +901,8 @@ def _save_locations_to_db(locations: list) -> int:
 
             # 坐标补全：LLM 给了就用，没给就从兜底表查，再没有就用上海市中心
             lat, lng = _fill_coords(name, loc.get("lat"), loc.get("lng"))
+            if lat is None or lng is None:
+                continue
 
             keywords = loc.get("keywords", [])
             # 优先用 LLM 给的 type，没有则从关键词推断

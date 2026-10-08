@@ -7,7 +7,9 @@ import { createMapView, searchPlaces } from "../services/map.js";
 import {
   toMin, fromMin, snap15, hasCoords, haversine, stopLocation, stopName, stopDuration, stopEnd, fmtDuration, estimateTravel,
   daySegments, dayStats, dayWarnings, reflowDay, optimizeDay, estimateCost, weatherInfo, weatherAdvice, dayDate, fmtDate, PACES,
+  isMeal, mealBlock, insights, TRAVEL_MODES,
 } from "../services/planner.js";
+import { navUrl, nearbyUrl, douyinUrl, anchorBefore } from "../services/links.js";
 import { newStopId, generateItinerary } from "../services/itinerary.js";
 import { saveTrip, autosave } from "../services/trips.js";
 import { stopCard, travelConnector, budgetPanel, checklistPanel } from "./itinerary-parts.js";
@@ -17,7 +19,6 @@ import { confirmDialog } from "../ui/modal.js";
 const TRANSPORT = [["transfer", "公交", "transit"], ["walking", "步行", "walk"], ["driving", "驾车", "taxi"], ["riding", "骑行", "route"]];
 const pad = (n) => String(n).padStart(2, "0");
 const clock = (d = new Date()) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-const douyin = (name) => `https://www.douyin.com/search/${encodeURIComponent(`${name} 攻略`)}`;
 
 export default {
   title: () => "路线编辑",
@@ -167,7 +168,28 @@ export default {
         const f = findStop(id);
         f && commit(() => (f.stop.duration_min = v));
       },
+      lock(id) {
+        const f = findStop(id);
+        if (!f) return;
+        commit(() => (f.stop.locked = !f.stop.locked), { message: f.stop.locked ? "已取消锁定" : `已锁定 ${f.stop.time}：自动排时间、优化顺序都不会改动它` });
+      },
     };
+
+    /** 同一个地点不重复加入：提示它已经在第几天，并高亮出来 */
+    function alreadyIn(name) {
+      for (let di = 0; di < days().length; di++) {
+        const hit = days()[di].items.find((s) => !isMeal(s) && stopName(s) === name);
+        if (hit) {
+          toast(`「${name}」已经在 ${days()[di].title} 里了`, { error: true });
+          const el = bodyEl.querySelector(`.stop[data-id="${CSS.escape(hit.__stopId)}"]`);
+          el?.scrollIntoView({ behavior: "smooth", block: "center" });
+          el?.classList.add("flash");
+          setTimeout(() => el?.classList.remove("flash"), 1200);
+          return true;
+        }
+      }
+      return false;
+    }
 
     /** 「换一个」：从推荐池挑同类型、最近的景点替换，原景点回到推荐池 */
     function replaceWithSimilar({ di, si, stop }) {
@@ -195,6 +217,7 @@ export default {
     function addRec(recIdx, di, idx) {
       const recs = itin().recommendations || [];
       if (!recs[recIdx] || !days()[di]) return;
+      if (alreadyIn(recs[recIdx].location?.name || recs[recIdx].activity)) return;
       commit(() => {
         const [rec] = recs.splice(recIdx, 1);
         const s = recToStop(rec);
@@ -232,12 +255,47 @@ export default {
       return h("span", { class: ["wx", info.rain && "wx--rain"], title: weatherAdvice(w) || info.label }, icon(info.icon), `${info.label} ${Math.round(w.tmin)}–${Math.round(w.tmax)}℃`, w.rain_prob >= 30 && h("small", null, `降水 ${w.rain_prob}%`));
     }
 
+    /** 出发前：倒计时与待确认事项；旅行中：今天的下一站（含导航） */
+    function tripBanner() {
+      const start = dayDate(state.trip.startDate, 0);
+      if (!start) return null;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const diff = Math.round((start - today) / 86400000);
+      if (diff > 0) {
+        const todo = days().flatMap((d) => d.items).filter((s) => !isMeal(s) && insights(stopLocation(s)).needsBooking).map(stopName);
+        return h("div", { class: "trip-banner" }, icon("calendar"), h("span", null, h("b", null, `距离出发还有 ${diff} 天`), todo.length ? `，记得提前预约：${todo.join("、")}` : "，行前清单里有为你准备的待办"));
+      }
+      const di = -diff;
+      if (di < 0 || di >= days().length) return null;
+      const now = new Date().getHours() * 60 + new Date().getMinutes();
+      const segs = daySegments(days()[di]).filter((x) => !isMeal(x.stop));
+      const cur = segs.find((x) => x.start != null && x.start <= now && x.end > now);
+      const next = segs.find((x) => x.start != null && x.start > now);
+      if (!cur && !next) return h("div", { class: "trip-banner" }, icon("check"), h("span", null, h("b", null, `今天是 Day ${di + 1}`), "，今天的行程已经走完，好好休息"));
+      const target = next || cur;
+      const loc = stopLocation(target.stop);
+      const t = cur && next ? estimateTravel(stopLocation(cur.stop), loc) : null;
+      const left = next ? next.start - now : 0;
+      return h(
+        "div",
+        { class: "trip-banner trip-banner--live" },
+        icon("nav"),
+        h("span", null,
+          h("b", null, `今天 Day ${di + 1}`),
+          cur ? ` · 正在「${stopName(cur.stop)}」` : "",
+          next ? ` · 下一站「${stopName(next.stop)}」${fromMin(next.start)}（还有 ${fmtDuration(left)}）` : " · 这是今天最后一站",
+          t ? ` · ${TRAVEL_MODES[t.mode].label}约 ${t.minutes} 分钟` : ""),
+        h("a", { class: "btn btn--sm btn--ink", href: navUrl(loc), target: "_blank", rel: "noopener noreferrer" }, icon("nav"), "导航")
+      );
+    }
+
     function renderHead() {
       const c = state.cost || estimateCost(itin(), { budget: state.trip.budget });
       const allStats = days().map(dayStats);
       const stops = allStats.reduce((n, s) => n + s.count, 0);
       const travel = allStats.reduce((n, s) => n + s.travelMin, 0);
-      const warnCount = days().reduce((n, d) => n + dayWarnings(d, state.trip.pace).filter((w) => w.level === "warn").length, 0);
+      const warnCount = days().reduce((n, d, di) => n + dayWarnings(d, state.trip.pace, { date: dayDate(state.trip.startDate, di) }).filter((w) => w.level === "warn").length, 0);
       const over = c.budget && !c.within_budget;
 
       const saveLabel = saveState === "saved" ? `已保存 ${savedAt || ""}` : saveState === "dirty" ? "有未同步的修改" : "尚未保存";
@@ -245,7 +303,7 @@ export default {
         headEl,
         h("a", { class: "back-link", href: "#/places" }, icon("arrow-left"), "返回地点筛选"),
         h("div", { class: "itin-title" },
-          h("div", null, h("p", { class: "eyebrow" }, "STEP 06 · 路线编辑"), h("h1", null, "你的", h("span", { class: "mark" }, "专属路线")), h("p", { class: "muted" }, itin().summary || `${state.trip.city} ${days().length} 日行程`)),
+          h("div", null, h("p", { class: "eyebrow" }, "STEP 06 · 路线编辑"), h("h1", null, "你的", h("span", { class: "mark" }, "专属路线")), h("p", { class: "muted" }, itin().summary || `${state.trip.city} ${days().length} 日行程`), itin().engine && h("p", { class: "engine-note" }, icon(itin().engine === "llm" ? "sparkles" : "route"), itin().engine === "llm" ? "大模型编排，行程引擎校验过时间与地点" : "行程引擎编排：按地理分天、建议时段、通勤与饭点排时间")),
           h("div", { class: "itin-tools" },
             h("div", { class: "tool-group" },
               h("button", { class: "icon-btn", type: "button", "aria-label": "撤销", title: "撤销 (Ctrl+Z)", disabled: !undoStack.length, onclick: undo }, icon("undo")),
@@ -260,6 +318,7 @@ export default {
           stat("地点", `${stops}`, "个"),
           stat("通勤", fmtDuration(travel).replace(" 小时 ", "h").replace(" 分钟", "m").replace(" 小时", "h").replace(" 分", "m"), "全程"),
           h("button", { class: ["stat stat--btn", over && "is-over"], type: "button", onclick: () => setTab("budget") }, h("small", null, over ? "超出预算" : "人均预计"), h("b", null, `¥${c.per_person}`), h("span", null, c.budget ? `预算 ¥${c.budget}` : "设置预算 →"))),
+        tripBanner(),
         warnCount ? h("button", { class: "banner banner--warn banner--btn", type: "button", onclick: () => setTab("route") }, icon("alert"), `有 ${warnCount} 处安排需要留意，已在对应的天里标出`) : null
       );
     }
@@ -294,7 +353,7 @@ export default {
 
     function daySection(day, di) {
       const stats = dayStats(day);
-      const warns = dayWarnings(day, state.trip.pace);
+      const warns = dayWarnings(day, state.trip.pace, { date: dayDate(state.trip.startDate, di) });
       const segs = daySegments(day);
       const dt = dayDate(state.trip.startDate, di);
       const conflict = warns.some((w) => w.code === "time-conflict");
@@ -304,7 +363,7 @@ export default {
       const list = h("ol", { class: "stops", "data-di": di });
       segs.forEach((seg) => {
         if (seg.index > 0) list.append(travelConnector(seg));
-        list.append(stopCard({ stop: seg.stop, di, si: seg.index, count: segs.length, days: days().length, active: seg.stop.__stopId === activeId, feedback: state.feedbacks[seg.stop.__stopId], warn: warnIds.has(seg.stop.__stopId) }, act));
+        list.append(stopCard({ stop: seg.stop, di, si: seg.index, count: segs.length, days: days().length, active: seg.stop.__stopId === activeId, feedback: state.feedbacks[seg.stop.__stopId], warn: warnIds.has(seg.stop.__stopId), anchor: isMeal(seg.stop) ? anchorBefore(day.items, seg.index) : null, city: state.trip.city }, act));
       });
       if (!segs.length) list.append(h("li", { class: "day-empty" }, "这天还是空的：把下方推荐拖进来，或点「添加景点」"));
 
@@ -380,8 +439,16 @@ export default {
           loc.cost_level && [h("dt", null, "消费"), h("dd", null, loc.cost_level)],
           loc.address && [h("dt", null, "地址"), h("dd", null, loc.address)],
           loc.tips && [h("dt", null, "小贴士"), h("dd", null, loc.tips)]),
+        insights(loc).needsBooking && h("p", { class: "card-flag" }, icon("alert"), "需要提前预约 / 订位"),
+        insights(loc).lastTime != null && h("p", { class: "card-flag" }, icon("clock"), `末班约 ${fromMin(insights(loc).lastTime)}`),
         h("div", { class: "card-actions" },
-          h("a", { class: "btn btn--sm btn--quiet", href: douyin(stopName(f.stop)), target: "_blank", rel: "noopener noreferrer" }, icon("film"), "抖音攻略", icon("external")),
+          isMeal(f.stop)
+            ? h("a", { class: "btn btn--sm btn--ink", href: nearbyUrl(anchorBefore(days()[f.di].items, f.si), "美食", state.trip.city), target: "_blank", rel: "noopener noreferrer" }, icon("food"), "附近餐厅")
+            : [
+                h("a", { class: "btn btn--sm btn--ink", href: navUrl(loc), target: "_blank", rel: "noopener noreferrer" }, icon("nav"), "导航"),
+                h("a", { class: "btn btn--sm btn--quiet", href: nearbyUrl(loc, "美食", state.trip.city), target: "_blank", rel: "noopener noreferrer" }, icon("food"), "附近吃的"),
+                h("a", { class: "btn btn--sm btn--quiet", href: douyinUrl(stopName(f.stop)), target: "_blank", rel: "noopener noreferrer" }, icon("film"), "抖音攻略"),
+              ],
           h("button", { class: "btn btn--sm btn--quiet", type: "button", onclick: () => act.remove(f.stop.__stopId) }, icon("trash"), "删除"))
       );
     }
@@ -457,6 +524,7 @@ export default {
         btn.focus();
       };
       const pick = (loc, custom) => {
+        if (alreadyIn(loc.name)) return;
         commit(() => {
           const stop = { time: "", location_id: loc.id && !String(loc.id).startsWith("poi_") ? loc.id : null, activity: `探索${loc.name}`, notes: loc.tips || loc.description || "", __stopId: newStopId(custom ? "custom" : "add"), location: { name: loc.name, lat: loc.lat, lng: loc.lng, type: loc.type || "landmark", category: loc.category, description: loc.description, address: loc.address, duration_min: loc.duration_min, cost_level: loc.cost_level, best_time: loc.best_time, tips: loc.tips } };
           stop.time = nextTime(di, stop);
@@ -477,7 +545,21 @@ export default {
       }, 250);
       input.addEventListener("input", search);
       input.addEventListener("keydown", (e) => e.key === "Escape" && close());
-      mountInto(slot, h("div", { class: "add-form" }, input, h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: close }, "取消")), results);
+      const addMeal = (kind) => {
+        commit(() => {
+          const block = { ...mealBlock(kind), __stopId: newStopId("meal") };
+          const items = days()[di].items;
+          const lo = kind === "lunch" ? 11 * 60 + 30 : 17 * 60 + 30;
+          const at = items.findIndex((x) => (toMin(x.time) ?? 0) >= lo);
+          items.splice(at < 0 ? items.length : at, 0, block);
+        }, { reflow: [di], message: `已预留${kind === "lunch" ? "午餐" : "晚餐"}时段，点卡片上的餐具图标可以搜附近餐厅` });
+      };
+      mountInto(
+        slot,
+        h("div", { class: "add-form" }, input, h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: close }, "取消")),
+        h("div", { class: "chip-row add-meal" }, h("span", { class: "faint" }, "或者："), h("button", { class: "chip", type: "button", onclick: () => addMeal("lunch") }, icon("food"), "预留午餐时段"), h("button", { class: "chip", type: "button", onclick: () => addMeal("dinner") }, icon("food"), "预留晚餐时段")),
+        results
+      );
       input.focus();
     }
 
@@ -566,7 +648,7 @@ export default {
       if (!(await confirmDialog({ title: "重新生成路线？", message: "会基于「地点筛选」里勾选的地点重新排一遍，当前的手动修改将被替换（可撤销）。", confirmText: "重新生成" }))) return;
       const before = snap();
       try {
-        toast("AI 正在重新排路线…");
+        toast("正在重新排路线…");
         await generateItinerary(selected);
         undoStack.push(before);
         redoStack.length = 0;

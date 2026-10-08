@@ -8,6 +8,7 @@ LLM 服务 - 封装与大语言模型的交互
 import json
 import logging
 import re
+import time
 import requests
 from urllib.parse import quote
 from openai import OpenAI
@@ -31,6 +32,35 @@ if Config.HAS_LLM:
         timeout=Config.LLM_TIMEOUT,
         max_retries=Config.LLM_MAX_RETRIES,
     )
+
+
+# ---------------------------------------------------------------- 熔断 ----
+# Key 写错 / 服务不可达时，每次调用都会等到超时（几十秒），整个应用像卡死一样。
+# 连续失败后在冷却期内直接跳过远程调用，走本地规则引擎，过后自动重试。
+_BREAKER = {"llm": 0.0, "doubao": 0.0}
+_COOLDOWN_SECONDS = 180
+
+
+def _available(name: str) -> bool:
+    return time.time() >= _BREAKER[name]
+
+
+def _trip(name: str, err) -> None:
+    _BREAKER[name] = time.time() + _COOLDOWN_SECONDS
+    logger.warning("%s 调用失败，%d 秒内改用本地能力：%s", name, _COOLDOWN_SECONDS, err)
+
+
+def _reset(name: str) -> None:
+    _BREAKER[name] = 0.0
+
+
+def llm_status() -> dict:
+    """供 /api/health 展示当前 AI 能力是否可用"""
+    return {
+        "llm": Config.HAS_LLM and _available("llm"),
+        "web_search": Config.HAS_WEB_SEARCH and (_available("doubao") if Config.HAS_DOUBAO else _available("llm")),
+        "asr": Config.HAS_ASR,
+    }
 
 
 def _extract_responses_text(data: dict) -> str:
@@ -92,7 +122,7 @@ def _extract_responses_stream_text(text: str) -> str:
 
 def _call_openai_responses(prompt: str, use_web_search: bool = False, model: str = None) -> str:
     """调用 OpenAI 兼容 Responses API，可选 live web_search 工具"""
-    if not Config.HAS_LLM:
+    if not Config.HAS_LLM or not _available("llm"):
         return ""
 
     url = f"{Config.LLM_BASE_URL.rstrip('/')}/responses"
@@ -115,16 +145,19 @@ def _call_openai_responses(prompt: str, use_web_search: bool = False, model: str
         response_text = resp.content.decode("utf-8", "replace")
         text = _extract_responses_stream_text(response_text)
         if text:
+            _reset("llm")
             return text
         logger.warning("OpenAI Responses API returned no text")
         return ""
     except Exception as e:
-        logger.error(f"OpenAI Responses API error: {e}")
+        _trip("llm", e)
         return ""
 
 
 def _call_openai_web_search(prompt: str) -> str:
-    """调用 OpenAI 兼容 Responses API 做 live 联网搜索"""
+    """调用 OpenAI Responses API 做 live 联网搜索（仅 LLM_WIRE_API=responses 时可用）"""
+    if Config.LLM_WIRE_API != "responses" or Config.LLM_WEB_SEARCH != "live":
+        return ""
     return _call_openai_responses(prompt, use_web_search=True, model=Config.LLM_WEB_SEARCH_MODEL)
 
 
@@ -133,7 +166,7 @@ def _call_doubao_responses(prompt: str, use_web_search: bool = False) -> str:
     调用豆包 (火山方舟 Ark) Responses API
     use_web_search=True 时启用联网搜索工具
     """
-    if not Config.HAS_DOUBAO:
+    if not Config.HAS_DOUBAO or not _available("doubao"):
         return ""
 
     url = f"{Config.DOUBAO_BASE_URL}/responses"
@@ -163,9 +196,10 @@ def _call_doubao_responses(prompt: str, use_web_search: bool = False) -> str:
                     if content.get("type") == "output_text":
                         output_text += content.get("text", "")
 
+        _reset("doubao")
         return output_text.strip()
     except Exception as e:
-        logger.error(f"Doubao Responses API error: {e}")
+        _trip("doubao", e)
         return ""
 
 
@@ -422,7 +456,7 @@ def discover_trip_attractions(city: str, days: int, profile: dict) -> list:
     返回约 20 个地点，每个包含
     name/type/lat/lng/keywords/video_hint/douyin_search_url/link_label/selected/reason
     """
-    if not Config.HAS_LLM and not Config.HAS_DOUBAO:
+    if not Config.HAS_WEB_SEARCH:
         return []
 
     city = city or "上海"
@@ -511,7 +545,7 @@ def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 
     """
     调用 LLM 进行对话补全
     """
-    if not Config.HAS_LLM:
+    if not Config.HAS_LLM or not _available("llm"):
         return ""
 
     prompt_parts = []
@@ -523,7 +557,9 @@ def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 
     prompt = "\n\n".join(prompt_parts)
 
     if Config.LLM_WIRE_API == "responses":
-        return _call_openai_responses(prompt, use_web_search=False, model=Config.LLM_MODEL)
+        text = _call_openai_responses(prompt, use_web_search=False, model=Config.LLM_MODEL)
+        if text or not _available("llm"):
+            return text
 
     if not client:
         return ""
@@ -539,110 +575,98 @@ def chat_completion(messages: list, temperature: float = 0.7, max_tokens: int = 
         if content is None:
             logger.warning("LLM 返回空内容")
             return ""
+        _reset("llm")
         return content.strip()
     except Exception as e:
-        logger.error(f"LLM API error: {e}")
+        _trip("llm", e)
         return ""
 
 
-def generate_itinerary(locations: list, user_profile: dict, trip_config: dict) -> dict:
+def generate_itinerary(locations: list, user_profile: dict, trip_config: dict, catalog: list | None = None) -> dict:
     """
-    生成个性化旅行路线
+    生成行程：有大模型时让它编排，再用行程引擎校验与修正；没有或失败时直接用行程引擎。
+    返回的 dict 带一个内部字段 _engine（llm / local），由路由层取出。
     """
-    # 构建地点信息
-    locations_text = "\n".join([
-        f"- {loc['name']} ({loc['category']})：{loc['description']}"
-        f"  标签：{', '.join(loc['tags'])}"
-        f"  停留时间：约{loc['duration_min']}分钟"
-        f"  拥挤度：{loc['crowd_level']}"
-        f"  费用：{loc['cost_level']}"
-        for loc in locations
-    ])
+    from backend.services.planner import PACES, build_itinerary, finalize_llm_itinerary, insights, pace_of
 
-    # 构建用户画像
-    profile_text = ""
-    if user_profile:
-        p = user_profile
-        profile_text = f"""
-用户旅行人格：{p.get('personality_name', '未知')}
-- 节奏偏好：{p.get('pace_label', '适中')}
-- 地点偏好：{p.get('pref_label', '混合')}
-- 体验偏好：{p.get('exp_label', '综合')}
-- 社交偏好：{p.get('social_label', '灵活')}
-"""
+    catalog = catalog or []
+    profile = user_profile or {}
+    pace_key = pace_of(profile, trip_config.get("pace"))
 
-    days = trip_config.get("days", 2)
-    companions = trip_config.get("companions", "")
-    budget = trip_config.get("budget", "中等")
+    if Config.HAS_LLM and _available("llm"):
+        days = trip_config.get("days", 2)
+        loc_lines = []
+        for loc in locations:
+            info = insights(loc)
+            extra = []
+            if info["closed_weekdays"]:
+                extra.append("周" + "".join("一二三四五六日"[w] for w in info["closed_weekdays"]) + "不开放")
+            if info["needs_booking"]:
+                extra.append("需预约")
+            loc_lines.append(
+                f"- [{loc['id']}] {loc['name']}（{loc.get('category') or loc.get('type')}）建议时段：{loc.get('best_time') or '不限'}；"
+                f"停留约 {loc.get('duration_min') or 60} 分钟；坐标 {loc.get('lat')},{loc.get('lng')}"
+                + (f"；{'；'.join(extra)}" if extra else "")
+                + (f"；{loc.get('tips')}" if loc.get("tips") else "")
+            )
+        labels = " / ".join(profile.get(k) for k in ("di_label", "rl_label", "ps_label", "cd_label") if profile.get(k))
+        deep = profile.get("deep_profile") or {}
+        persona = f"旅行人格：{profile.get('personality_name') or '未测试'}" + (f"（{labels}）" if labels else "")
+        if deep.get("summary"):
+            persona += f"\n深度画像：{deep['summary']}"
+        if deep.get("avoid"):
+            persona += f"\n想避免：{'、'.join(deep['avoid'])}"
+        start = trip_config.get("start_date")
+        prompt = f"""你是专业的旅行路线规划师。只能使用下面列出的地点（用方括号里的 id 引用），不要编造新地点。
 
-    companion_line = f"- 同行人：{companions}" if companions else ""
+## 候选地点
+{chr(10).join(loc_lines)}
 
-    prompt = f"""你是一个专业的旅行路线规划师。请根据以下信息生成一份详细的旅行路线。
+## 用户
+{persona}
+- 天数：{days} 天{f"，{start} 出发" if start else ""}
+- 节奏：{PACES[pace_key]['label']}（每天最多 {PACES[pace_key]['max_stops']} 个地点）
+- 同行：{trip_config.get('companions') or '未说明'}；预算：{trip_config.get('budget') or '未说明'}
 
-## 可选地点
-{locations_text}
+## 规则
+1. 按地理位置把相邻地点放在同一天，避免来回折返
+2. 尊重「建议时段」：夜景等傍晚 / 夜间景点放在当天最后
+3. 遵守不开放日；时间要留出停留时长与通勤
+4. 放不下的地点放进 recommendations
 
-## 用户信息
-{profile_text}
-- 旅行天数：{days}天
-{companion_line}
-- 预算：{budget}
+只输出 JSON：
+{{"summary": "2-3 句概述", "days": [{{"day": 1, "title": "Day 1 · 主题", "items": [{{"time": "09:30", "location_id": "loc_001", "activity": "做什么", "notes": "一句实用提示"}}]}}],
+ "recommendations": [{{"location_id": "loc_002", "activity": "做什么", "reason": "一句理由"}}], "tips": ["整体建议"]}}"""
+        result = chat_completion(
+            [
+                {"role": "system", "content": "你是专业的旅行规划师。只输出合法 JSON，不要 Markdown、不要解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+            max_tokens=3000,
+        )
+        raw = None
+        if result:
+            text = result
+            if "```" in text:
+                text = text.split("```json")[-1] if "```json" in text else text.split("```")[1]
+                text = text.split("```")[0]
+            try:
+                raw = json.loads(text.strip())
+            except json.JSONDecodeError:
+                start_i, end_i = text.find("{"), text.rfind("}")
+                try:
+                    raw = json.loads(text[start_i:end_i + 1]) if start_i >= 0 else None
+                except json.JSONDecodeError:
+                    logger.warning("大模型返回的行程不是合法 JSON，改用行程引擎")
+        fixed = finalize_llm_itinerary(raw, locations, profile, trip_config, catalog) if raw else None
+        if fixed:
+            fixed["_engine"] = "llm"
+            return fixed
 
-## 要求
-1. 根据地理位置的相邻性安排路线，减少来回奔波
-2. 根据用户旅行人格调整节奏和内容
-3. **每天最多安排 4 个核心景点**，留出休息和用餐时间
-4. 考虑地点的最佳到访时间
-5. 给出实用的交通建议
-6. 把未安排进每天行程的备选景点放入 recommendations（推荐池），供用户自由选择
-
-请以 JSON 格式输出，格式如下：
-{{
-  "summary": "路线概述（2-3句话）",
-  "days": [
-    {{
-      "day": 1,
-      "title": "Day 1 主题",
-      "items": [
-        {{
-          "time": "09:00",
-          "location_id": "loc_xxx",
-          "activity": "活动描述",
-          "notes": "小贴士"
-        }}
-      ]
-    }}
-  ],
-  "recommendations": [
-    {{
-      "location_id": "loc_xxx",
-      "activity": "推荐活动",
-      "reason": "推荐理由（一句话）"
-    }}
-  ],
-  "tips": ["整体建议1", "整体建议2"]
-}}"""
-
-    messages = [
-        {"role": "system", "content": "你是一个专业的旅行规划师，擅长根据用户偏好生成个性化路线。只输出JSON，不要其他文字。"},
-        {"role": "user", "content": prompt},
-    ]
-
-    result = chat_completion(messages, temperature=0.7)
-
-    if result:
-        try:
-            # 尝试提取 JSON
-            if "```json" in result:
-                result = result.split("```json")[1].split("```")[0]
-            elif "```" in result:
-                result = result.split("```")[1].split("```")[0]
-            return json.loads(result)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response as JSON")
-
-    # 降级到本地规则生成
-    return _generate_fallback_itinerary(locations, user_profile, trip_config)
+    plan = build_itinerary(locations, profile, trip_config, catalog)
+    plan["_engine"] = "local"
+    return plan
 
 
 def chat_with_companion(message: str, context: dict) -> str:
@@ -683,95 +707,5 @@ def chat_with_companion(message: str, context: dict) -> str:
     # 加入当前消息
     messages.append({"role": "user", "content": message})
 
-    result = chat_completion(messages, temperature=0.8)
-
-    if result:
-        return result
-
-    # 降级到本地回复
-    return _generate_fallback_reply(message, context)
-
-
-def _generate_fallback_itinerary(locations: list, user_profile: dict, trip_config: dict) -> dict:
-    """
-    本地规则引擎生成路线（无 LLM 时的降级方案）
-    已安排景点每天最多 4 个（有明确时间），多余景点放入推荐池
-    """
-    days = trip_config.get("days", 2)
-
-    # 按地理位置简单分组（按纬度+经度的和排序，实现简单的地理聚类）
-    sorted_locs = sorted(locations, key=lambda l: l["lat"] + l["lng"])
-
-    # 每天最多安排 4 个景点
-    max_per_day = 4
-    total_scheduled = max_per_day * days
-
-    scheduled_locs = sorted_locs[:total_scheduled]
-    extra_locs = sorted_locs[total_scheduled:]
-
-    # 分配已安排景点到各天
-    days_plan = []
-    for day_idx in range(days):
-        start = day_idx * max_per_day
-        end = start + max_per_day
-        day_locs = scheduled_locs[start:end]
-
-        items = []
-        times = ["09:30", "12:00", "14:30", "17:00"]
-        for i, loc in enumerate(day_locs):
-            items.append({
-                "time": times[i] if i < len(times) else "19:00",
-                "location_id": loc["id"],
-                "activity": f"探索{loc['name']}",
-                "notes": loc.get("tips", ""),
-            })
-
-        days_plan.append({
-            "day": day_idx + 1,
-            "title": f"Day {day_idx + 1}",
-            "items": items,
-        })
-
-    # 推荐池：多余的景点
-    recommendations = []
-    for loc in extra_locs:
-        recommendations.append({
-            "location_id": loc["id"],
-            "activity": f"探索{loc['name']}",
-            "reason": loc.get("description", "") or loc.get("tips", "") or f"{loc['name']}值得一逛",
-        })
-
-    result = {
-        "summary": f"为您规划了{days}天的上海旅行路线，已安排 {len(scheduled_locs)} 个核心景点。",
-        "days": days_plan,
-        "recommendations": recommendations,
-        "tips": ["建议穿舒适的步行鞋", "上海地铁很方便，建议多利用地铁出行"],
-    }
-    return result
-
-
-def _generate_fallback_reply(message: str, context: dict) -> str:
-    """
-    本地规则引擎回复（无 LLM 时的降级方案）
-    """
-    msg = message.lower()
-
-    if any(w in msg for w in ["下雨", "雨", "天气"]):
-        return "下雨了？别担心！建议去室内景点逛逛，比如 1933老场坊 或 M50创意园，都是室内的，拍照也很出片 ☔"
-
-    if any(w in msg for w in ["累", "休息", "疲惫", "坐下"]):
-        return "走累了吧？找个咖啡店坐坐吧～推荐去东平路或安福路附近，梧桐树下喝杯咖啡，歇歇脚 ☕"
-
-    if any(w in msg for w in ["吃", "餐厅", "饿", "午饭", "晚饭"]):
-        return "想吃东西的话，乌鲁木齐中路有很多不错的小店！或者去田子坊附近，小吃选择很多 🍜"
-
-    if any(w in msg for w in ["拍照", "出片", "好看"]):
-        return "想拍照的话，武康大楼绝对是首选！光影效果一流。如果想人少点，推荐去1933老场坊，建筑结构特别出片 📸"
-
-    if any(w in msg for w in ["人多", "排队", "拥挤"]):
-        return "觉得人多？可以试试去 M50创意园 或 甜爱路，这两个地方相对小众，人少很多 👍"
-
-    if any(w in msg for w in ["路线", "怎么走", "交通"]):
-        return "上海地铁很方便！推荐下载高德地图，步行导航很准。两个地点之间如果超过3公里，建议地铁出行 🚇"
-
-    return "我在呢！有什么想问的尽管说～可以问我路线调整、美食推荐、拍照点、或者任何临时的问题 😊"
+    # 大模型不可用时返回空串，由路由层改用本地助手（基于行程与景点库计算的回答）
+    return chat_completion(messages, temperature=0.8)

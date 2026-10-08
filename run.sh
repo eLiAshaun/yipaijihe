@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
-# 一拍迹合 · 一键启动：创建虚拟环境 → 安装依赖 → 启动服务
+# 一拍迹合 · 一键启动（macOS / Linux）
+# 创建虚拟环境 → 安装依赖 → 启动服务并打开浏览器
 set -euo pipefail
 cd "$(dirname "$0")"
 
-command -v python3 >/dev/null || { echo "❌ 未找到 python3，请先安装 Python 3.10+"; exit 1; }
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    PY="$c"; break
+  fi
+done
+[ -n "$PY" ] || { echo "❌ 需要 Python 3.10 及以上版本：https://www.python.org/downloads/"; exit 1; }
 
-if [ ! -d .venv ]; then
+if [ ! -x .venv/bin/python ]; then
   echo "📦 创建虚拟环境 .venv ..."
-  python3 -m venv .venv
+  "$PY" -m venv .venv
 fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
 
-if ! python -c "import flask" 2>/dev/null; then
-  echo "📦 安装依赖 ..."
-  pip install -q -r requirements.txt
+if ! .venv/bin/python -c "import flask, flask_cors, dotenv, openai, requests" 2>/dev/null; then
+  echo "📦 安装依赖（首次约 1 分钟）..."
+  .venv/bin/python -m pip install -q --upgrade pip
+  .venv/bin/python -m pip install -q -r requirements.txt
 fi
 
 if [ ! -f .env ]; then
-  echo "📝 未找到 .env，将以 Demo 模式运行（无 LLM / 语音转写，景点与路线使用内置数据）"
-  echo "   需要 AI 能力请：cp .env.example .env 并填写 Key"
+  cp .env.example .env
+  echo "📝 已生成 .env（全部留空即可运行；需要 AI 能力时再填写 Key）"
 fi
 
-echo "🌐 http://localhost:${FLASK_PORT:-5000}"
-exec python app.py
+export OPEN_BROWSER="${OPEN_BROWSER:-1}"
+exec .venv/bin/python app.py

@@ -112,6 +112,7 @@ def init_db():
 
     conn.commit()
 
+    _ensure_columns(conn)
     _migrate_legacy_history(conn)
 
     # ========== 种子数据（仅首次） ==========
@@ -229,3 +230,24 @@ def _migrate_legacy_history(conn):
     if rows:
         conn.commit()
         logger.info("已迁移 %d 位用户的旧版旅行历史到 trips 表", len(rows))
+
+
+def list_cities():
+    """返回有内置景点库的城市（含中心坐标），供前端城市选择与天气查询使用"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT c.name, c.center_lat, c.center_lng, COUNT(a.id) AS n "
+            "FROM cities c LEFT JOIN attractions a ON a.city = c.name GROUP BY c.name ORDER BY n DESC"
+        ).fetchall()
+        return [{"name": r["name"], "lat": r["center_lat"], "lng": r["center_lng"], "places": r["n"]} for r in rows]
+    finally:
+        conn.close()
+
+
+def _ensure_columns(conn):
+    """给旧数据库补上新增的列（SQLite 没有 IF NOT EXISTS 的 ADD COLUMN）"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "is_guest" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_guest INTEGER NOT NULL DEFAULT 0")
+        conn.commit()

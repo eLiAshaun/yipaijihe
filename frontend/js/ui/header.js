@@ -3,7 +3,7 @@ import { icon } from "../core/icons.js";
 import { state, bus, storage, hasItinerary } from "../core/state.js";
 import { STORAGE, STEPS } from "../core/config.js";
 import { navigate, href } from "../core/router.js";
-import { logout } from "../services/auth.js";
+import { logout, claimAccount } from "../services/auth.js";
 import { toast } from "./toast.js";
 import { openModal, confirmDialog } from "./modal.js";
 import { listTrips, applyTrip, deleteTrip } from "../services/trips.js";
@@ -145,12 +145,44 @@ export async function openTripsModal() {
   }
 }
 
+/** 游客转正：设置用户名和密码，行程与人格结果保留 */
+export function openClaimModal() {
+  const err = h("p", { class: "form-error", role: "alert" });
+  const user = h("input", { class: "input", id: "claim-user", placeholder: "3–20 个字符", autocomplete: "username", autofocus: true });
+  const pass = h("input", { class: "input", id: "claim-pass", type: "password", placeholder: "6–20 个字符", autocomplete: "new-password" });
+  const submit = h("button", { class: "btn btn--primary", type: "submit" }, "保存账号");
+  const form = h(
+    "form",
+    { class: "auth-form", onsubmit: async (e) => {
+      e.preventDefault();
+      submit.classList.add("is-loading");
+      try {
+        await claimAccount(user.value.trim(), pass.value);
+        m.close();
+        toast("账号已设置，换台设备登录也能找回行程");
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.add("is-visible");
+      } finally {
+        submit.classList.remove("is-loading");
+      }
+    } },
+    h("p", { class: "muted" }, "游客数据只能在这台设备上找回。设置用户名和密码后，人格结果和行程都会保留。"),
+    err,
+    h("div", { class: "field" }, h("label", { for: "claim-user" }, "用户名"), user),
+    h("div", { class: "field" }, h("label", { for: "claim-pass" }, "密码"), pass),
+    submit
+  );
+  const m = openModal({ title: "设置账号", width: 440, body: form });
+}
+
 function userMenu() {
   const p = state.persona;
   const pop = h(
     "div",
     { class: "menu-pop", role: "menu" },
     h("div", { class: "menu-head" }, h("div", { class: "code" }, p?.mbti || "----"), h("div", { class: "name" }, p ? `${p.personality?.name || ""} · ${state.user.username}` : `${state.user.username} · 尚未测试人格`)),
+    state.user.is_guest && item("lock", "设置账号（换设备也能找回）", openClaimModal),
     p && item("compass", "查看旅行人格", showPersona),
     item("refresh", p ? "重新测试人格" : "开始人格测试", () => {
       state.persona = null;
@@ -181,6 +213,7 @@ function renderActions() {
     { class: "btn btn--quiet btn--sm user-btn", type: "button", "aria-haspopup": "menu", "aria-expanded": String(menuOpen), onclick: (e) => ((e.stopPropagation(), (menuOpen = !menuOpen), renderActions())) },
     h("span", { class: "avatar" }, state.user.username[0].toUpperCase()),
     h("span", { class: "user-name" }, state.user.username),
+    state.user.is_guest && h("span", { class: "tag tag--sun guest-tag" }, "游客"),
     icon("chevron-down")
   );
   mountInto(actions(), themeBtn, h("div", { class: "menu" }, trigger, menuOpen && userMenu()));

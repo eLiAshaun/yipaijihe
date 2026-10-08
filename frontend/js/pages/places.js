@@ -55,30 +55,47 @@ export default {
     const selected = () => places().filter((p) => state.selectedIds.has(p.id));
 
     // ------------------------------------------------ 数据加载 ----
+    /** 候选地点：联网搜索（若开启）或该城市的内置景点库，按旅行人格排序并预选 */
+    async function fetchRecommended() {
+      const data = await api.post("/api/locations/default-recommend", { profile: styleProfile(), city: state.trip.city, days: state.trip.days }, { signal: ctx.signal });
+      const src = data.source === "web_search" ? "ai_discover" : "builtin";
+      if (data.message) notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("info"), data.message));
+      return (data.attractions || []).map((l, i) => normalize(l, i, src));
+    }
+
     async function load() {
       if (places().length) return;
       mountInto(list, Array.from({ length: 5 }, () => h("div", { class: "skeleton", style: { height: "104px" } })));
-      notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("sparkles"), `AI 正在联网搜索「${state.trip.city}${state.trip.days}日游」里常被提到的景点，并按你的旅行人格筛选…（约 10–30 秒）`));
+      notice.replaceChildren(h("div", { class: "banner banner--info" }, icon("sparkles"), `正在准备「${state.trip.city}」的候选地点，并按你的旅行人格预选…`));
       let got = [];
       try {
-        const data = await api.post("/api/locations/default-recommend", { profile: styleProfile(), city: state.trip.city, days: state.trip.days }, { signal: ctx.signal });
-        got = (data.attractions || []).map((l, i) => normalize(l, i, data.source === "web_search" ? "ai_discover" : "builtin"));
-        if (data.fallback) toast(data.fallback_message || "联网搜索暂不可用，已使用本地精选景点库", { error: true });
+        got = await fetchRecommended();
       } catch (e) {
         if (e.name === "AbortError") return;
+        toastError(e);
       }
-      if (!got.length) {
-        try {
-          const data = await api.get(`/api/locations/list?city=${encodeURIComponent(state.trip.city)}`, { signal: ctx.signal });
-          got = (data.locations || []).map((l, i) => normalize(l, i, "builtin"));
-        } catch (e) {
-          if (e.name === "AbortError") return;
-          toastError(e);
-        }
-      }
+      if (notice.textContent.startsWith("正在准备")) notice.replaceChildren();
       state.places = got;
-      state.selectedIds = new Set(got.filter((p) => hasCoords(p) && isPersonalityMatch(p)).map((p) => p.id));
+      const pre = (p) => (typeof p.selected === "boolean" ? p.selected : isPersonalityMatch(p));
+      state.selectedIds = new Set(got.filter((p) => hasCoords(p) && pre(p)).map((p) => p.id));
       persistDraft();
+    }
+
+    /** 灵感素材里的地点之外，再从景点库补充一些（默认不勾选） */
+    async function addRecommended(btn) {
+      btn.classList.add("is-loading");
+      try {
+        const have = new Set(places().map((p) => p.name));
+        const extra = (await fetchRecommended()).filter((p) => !have.has(p.name));
+        state.places = [...places(), ...extra];
+        persistDraft();
+        toast(extra.length ? `补充了 ${extra.length} 个候选地点，勾选想去的即可` : "景点库里的地点都已经在列表里了");
+        renderAll();
+      } catch (e) {
+        toastError(e);
+      } finally {
+        btn.classList.remove("is-loading");
+      }
     }
 
     /** 视频里提取的地点常缺坐标 → 用地图 POI 搜索自动补全 */
@@ -131,6 +148,7 @@ export default {
               !match && h("span", { class: "tag" }, "风格不太搭"),
               !ok && h("span", { class: "tag tag--seal" }, "缺少坐标"),
               p.source === "video" && h("span", { class: "tag tag--sea" }, "来自视频"),
+              p.source === "inspiration" && h("span", { class: "tag tag--sea" }, "来自你的笔记"),
               p.source === "custom" && h("span", { class: "tag tag--sun" }, "自己添加")),
             p.reason && h("span", { class: "place-reason" }, p.reason),
             h("span", { class: "place-meta" },
@@ -157,10 +175,13 @@ export default {
             if (personaOnly) places().forEach((p) => !isPersonalityMatch(p) && state.selectedIds.delete(p.id));
             renderAll();
           } }), h("span", { class: "switch-track" }), "只看符合我风格的"),
-          h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: () => {
-            shown.forEach((p) => hasCoords(p) && (allOn ? state.selectedIds.delete(p.id) : state.selectedIds.add(p.id)));
-            renderAll();
-          } }, allOn ? "取消全选" : "全选当前")
+          h("span", { class: "filter-actions" },
+            places().some((p) => p.source === "video" || p.source === "inspiration") && !places().some((p) => p.source === "builtin" || p.source === "ai_discover") &&
+              h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: (e) => addRecommended(e.currentTarget) }, icon("plus"), "补充推荐地点"),
+            h("button", { class: "btn btn--ghost btn--sm", type: "button", onclick: () => {
+              shown.forEach((p) => hasCoords(p) && (allOn ? state.selectedIds.delete(p.id) : state.selectedIds.add(p.id)));
+              renderAll();
+            } }, allOn ? "取消全选" : "全选当前"))
         )
       );
     }
@@ -181,7 +202,7 @@ export default {
       mountInto(
         bar,
         h("div", { class: "action-sum" }, h("b", null, `已选 ${n} 个地点`), h("span", { class: n && (n < lo || n > hi) ? "warn" : "faint" }, tip)),
-        h("button", { class: ["btn btn--primary btn--lg", busy && "is-loading"], type: "button", disabled: !n || busy, onclick: generate }, busy ? "AI 正在排路线…" : "AI 生成旅行计划", !busy && icon("arrow-right", "i-arrow"))
+        h("button", { class: ["btn btn--primary btn--lg", busy && "is-loading"], type: "button", disabled: !n || busy, onclick: generate }, busy ? "正在排路线…" : "生成旅行计划", !busy && icon("arrow-right", "i-arrow"))
       );
     }
 
@@ -190,8 +211,8 @@ export default {
       if (!p?.mbti) return echo.replaceChildren();
       const pr = styleProfile();
       const tags = [pr.di_label, pr.rl_label, pr.ps_label, pr.cd_label].join(" · ");
-      const hasVideo = places().some((x) => x.source === "video");
-      mountInto(echo, icon("compass"), h("span", null, "根据你的旅行人格 ", h("b", null, `${p.personality?.name}（${p.mbti}）`), `，${hasVideo ? "从视频中提取" : "为你准备"}了 `, h("b", null, places().length), " 个地点，已按「", tags, "」预选。"));
+      const fromYou = places().some((x) => x.source === "video" || x.source === "inspiration");
+      mountInto(echo, icon("compass"), h("span", null, "根据你的旅行人格 ", h("b", null, `${p.personality?.name}（${p.mbti}）`), `，${fromYou ? "从你的灵感素材里找到" : "为你准备"}了 `, h("b", null, places().length), " 个地点，已按「", tags, "」预选。"));
     }
 
     function refreshMap() {
@@ -230,18 +251,24 @@ export default {
     }
 
     // ------------------------------------------------ 手动添加 ----
+    let catalog = null;
     function addBox() {
       const input = h("input", { class: "input", type: "text", placeholder: "想去的地方，如「武康大楼」「%Arabica」", "aria-label": "添加地点", autocomplete: "off" });
       const results = h("ul", { class: "suggest", role: "listbox" });
       const run = debounce(async () => {
         const q = input.value.trim();
         if (!q) return results.replaceChildren();
-        const hits = await searchPlaces(q, state.trip.city);
+        catalog ||= api.get(`/api/locations/list?city=${encodeURIComponent(state.trip.city)}`).then((d) => d.locations || []).catch(() => []);
+        const have = new Set(places().map((p) => p.name));
+        const local = (await catalog).filter((l) => !have.has(l.name) && (l.name.includes(q) || (l.tags || []).some((t) => t.includes(q)))).slice(0, 4);
+        const remote = q.length >= 2 ? await searchPlaces(q, state.trip.city) : [];
+        const hits = [...local.map((l) => ({ ...l, address: l.address || "内置景点库" })), ...remote.filter((r) => !local.some((l) => l.name === r.name))];
         mountInto(
           results,
           hits.length
             ? hits.map((hit) => h("li", null, h("button", { type: "button", role: "option", onclick: () => {
-                const p = normalize({ ...hit, source: "custom", reason: hit.address, keywords: [hit.category] }, places().length, "custom");
+                if (places().some((x) => x.name === hit.name)) return toast(`「${hit.name}」已经在列表里了`, { error: true });
+                const p = normalize({ ...hit, source: hit.id?.startsWith?.("loc_") ? "builtin" : "custom", reason: hit.reason || hit.tips || hit.address, keywords: hit.tags || [hit.category] }, places().length, "custom");
                 state.places = [...places(), p];
                 state.selectedIds.add(p.id);
                 persistDraft();
@@ -251,7 +278,7 @@ export default {
                 renderAll();
                 map?.focus(p.id);
               } }, h("b", null, hit.name), h("small", null, hit.address))))
-            : h("li", { class: "suggest-empty" }, "没有搜到结果（地图服务不可用时无法搜索）")
+            : h("li", { class: "suggest-empty" }, "景点库和地图里都没找到，换个叫法试试")
         );
       }, 300);
       input.addEventListener("input", run);

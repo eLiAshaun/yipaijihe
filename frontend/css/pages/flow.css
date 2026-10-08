@@ -133,3 +133,29 @@
 .found-x { position: absolute; right: 8px; top: 8px; opacity: 0; transition: opacity var(--dur-1); }
 .found:hover .found-x, .found-x:focus-visible { opacity: 1; }
 @media (hover: none) { .found-x { opacity: 1; } }
+
+/* ---- Guest / account ---- */
+.guest-btn { margin-top: 4px; }
+.guest-tag { margin-left: -2px; }
+
+/* ---- Persona picker ---- */
+.picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--s-4); }
+.pick { display: grid; grid-template-columns: 96px 1fr; gap: 14px; align-items: center; padding: 12px; text-align: left; background: var(--card); border: 1.5px solid var(--line); border-radius: var(--r-lg); transition: all var(--dur-2) var(--ease); }
+.pick:hover { border-color: var(--ink); transform: translateY(-3px); box-shadow: var(--shadow-2); }
+.pick img { width: 96px; height: 96px; border-radius: 14px; object-fit: cover; }
+.pick-body { display: grid; gap: 4px; min-width: 0; }
+.pick-body b { font-family: var(--font-display); font-size: var(--fs-lg); }
+.pick-body small { color: var(--seal); letter-spacing: 0.14em; }
+.pick-body .muted { font-size: var(--fs-sm); }
+.pick.is-loading { opacity: 0.6; pointer-events: none; }
+
+/* ---- City ---- */
+.city-box { display: grid; gap: 10px; }
+.city-box .chip small { margin-left: 2px; }
+.city-other { display: flex; gap: 8px; }
+.city-other .input { min-height: 38px; max-width: 220px; }
+
+/* ---- Inspiration ---- */
+.chip--muted { opacity: 0.6; text-decoration: line-through; }
+.cap-note { margin-top: -2px; }
+.found .quote { font-size: var(--fs-sm); font-style: normal; border-left: 3px solid var(--line); padding-left: 10px; }

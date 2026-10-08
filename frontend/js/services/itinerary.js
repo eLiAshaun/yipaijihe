@@ -29,6 +29,7 @@ export function requestBody() {
     destination: t.city,
     days: t.days,
     pace: t.pace,
+    start_date: t.startDate || "",
     companions: state.hasBuddy ? "和搭子一起" : "独自旅行",
     companion_type: state.hasBuddy ? "friends" : "solo",
     budget: t.budget ? `人均 ¥${t.budget}` : "",
@@ -82,6 +83,7 @@ export async function seedRecommendations(itin, want = 8) {
 export function applyGenerated(data, extraCatalog = []) {
   const catalog = [...(data.locations_used || []), ...extraCatalog];
   state.itinerary = normalizeItinerary(data.itinerary, catalog);
+  state.itinerary.engine = data.engine || "local";
   state.tripId = null;
   state.feedbacks = {};
   state.weather = [];

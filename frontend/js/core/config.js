@@ -24,7 +24,7 @@ export const STEPS = [
   { n: 1, route: "persona", label: "旅行人格" },
   { n: 2, route: "plan", label: "行程规划" },
   { n: 3, route: "buddy", label: "旅行搭子" },
-  { n: 4, route: "videos", label: "精选视频" },
+  { n: 4, route: "videos", label: "灵感素材" },
   { n: 5, route: "places", label: "地点筛选" },
   { n: 6, route: "itinerary", label: "路线编辑" },
   { n: 7, route: "export", label: "导出分享" },

@@ -15,7 +15,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import ffmpeg
 import requests
 from openai import OpenAI
 
@@ -78,8 +77,8 @@ class VideoProcessor:
     def __del__(self):
         self.cleanup()
 
-    def parse_share_url(self, share_text: str) -> dict:
-        """从分享文本中提取视频信息（复用 MCP server 逻辑）"""
+    def _load_share_item(self, share_text: str, timeout=REQUEST_TIMEOUT) -> tuple[dict, str]:
+        """解析分享链接，返回抖音页面里的作品数据（视频与图文笔记都支持）"""
         urls = re.findall(
             r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
             share_text,
@@ -97,7 +96,7 @@ class VideoProcessor:
             video_id = video_id_match.group(2)
         else:
             # 短链接跟随重定向
-            resp = requests.get(share_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(share_url, headers=HEADERS, allow_redirects=True, timeout=timeout)
             resp.raise_for_status()
             final_url = resp.url
             if "douyin.com" in final_url and "/video/" not in final_url and "/note/" not in final_url:
@@ -109,7 +108,7 @@ class VideoProcessor:
 
         # 获取视频页面
         page_url = f"https://www.iesdouyin.com/share/{share_type}/{video_id}"
-        resp = requests.get(page_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(page_url, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
 
         pattern = re.compile(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", re.DOTALL)
@@ -124,8 +123,16 @@ class VideoProcessor:
         items = info.get("item_list", [])
         if not items:
             raise ValueError(f"视频不存在或已被删除 (ID: {video_id})")
+        return items[0], video_id
 
-        item = items[0]
+    def fetch_title(self, share_text: str) -> str:
+        """只读取作品的标题 / 文案（无需语音转写 Key），失败时抛出异常"""
+        item, _ = self._load_share_item(share_text, timeout=(4, 8))
+        return (item.get("desc") or "").strip()
+
+    def parse_share_url(self, share_text: str) -> dict:
+        """从分享文本中提取视频信息（复用 MCP server 逻辑）"""
+        item, video_id = self._load_share_item(share_text)
         video = item.get("video") or {}
         url_list = video.get("play_addr", {}).get("url_list", [])
         if not url_list:
@@ -149,6 +156,7 @@ class VideoProcessor:
 
     def extract_audio(self, video_path: Path) -> Path:
         """从视频提取适合 ASR 的轻量音频。"""
+        import ffmpeg  # 延迟导入：只有真正处理音频时才需要 ffmpeg
         audio_path = video_path.with_suffix(".mp3")
         (
             ffmpeg.input(str(video_path))
@@ -167,6 +175,7 @@ class VideoProcessor:
 
     def split_audio(self, audio_path: Path, segment_duration: int = ASR_SEGMENT_DURATION) -> list[Path]:
         """将音频切片为多个片段"""
+        import ffmpeg  # 延迟导入：只有真正处理音频时才需要 ffmpeg
         probe = ffmpeg.probe(str(audio_path))
         duration = float(probe["format"]["duration"])
         num_segments = math.ceil(duration / segment_duration)

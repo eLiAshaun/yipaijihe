@@ -267,12 +267,18 @@
   }
 }
 
+@media (max-width: 480px) {
+  .brand > span { display: none; }
+}
+
 @media (max-width: 720px) {
   :root { --topbar-h: 58px; }
   .topbar { gap: var(--s-3); }
   .brand small { display: none; }
   .stepper-track { display: none; }
   .stepper { display: flex; justify-content: center; }
-  .step-compact { display: block; white-space: nowrap; font-size: 0.7rem; }
+  .step-compact { display: block; white-space: nowrap; font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .stepper { min-width: 0; overflow: hidden; }
+  .user-btn .guest-tag { display: none; }
   .page { padding-top: var(--s-5); }
 }
